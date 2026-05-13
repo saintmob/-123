@@ -1,15 +1,41 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Square, Volume2, UserCircle2, X, Mic, MicOff, Save, Upload } from 'lucide-react';
+import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { AVAILABLE_SOUNDS, SoundDef, engine } from './audio';
+import { AVAILABLE_SOUNDS, SoundDef, engineManager, FxParams, defaultFx } from './audio';
 import { cn } from './lib/utils';
 
+interface TabData {
+  id: string;
+  name: string;
+  slots: (SoundDef | null)[];
+  mutedSlots: boolean[];
+  fxSlots: FxParams[];
+  masterFx: FxParams;
+  isPlaying: boolean;
+  activeStep: number;
+}
+
 export default function App() {
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [slots, setSlots] = useState<(SoundDef | null)[]>(new Array(7).fill(null));
-  const [mutedSlots, setMutedSlots] = useState<boolean[]>(new Array(7).fill(false));
-  const [activeStep, setActiveStep] = useState(0);
+  const [tabs, setTabs] = useState<TabData[]>([{
+    id: 'tab-1',
+    name: 'Arrangement 1',
+    slots: new Array(7).fill(null),
+    mutedSlots: new Array(7).fill(false),
+    fxSlots: new Array(7).fill(null).map(defaultFx),
+    masterFx: defaultFx(),
+    isPlaying: false,
+    activeStep: 0
+  }]);
   
+  const [activeTabId, setActiveTabId] = useState('tab-1');
+  const activeTab = tabs.find(t => t.id === activeTabId) || tabs[0];
+
+  const [hoveredFxSlot, setHoveredFxSlot] = useState<number | null>(null);
+  const fxTimeoutRef = useRef<NodeJS.Timeout>();
+
+  const [hoveredTabFxId, setHoveredTabFxId] = useState<string | null>(null);
+  const tabFxTimeoutRef = useRef<NodeJS.Timeout>();
+
   // Recording & Upload states
   const [isRecording, setIsRecording] = useState(false);
   const [recordedSounds, setRecordedSounds] = useState<SoundDef[]>([]);
@@ -19,37 +45,125 @@ export default function App() {
 
   useEffect(() => {
     const handleStep = (e: any) => {
-      setActiveStep(e.detail.step);
+      const { projectId, step } = e.detail;
+      setTabs(prev => prev.map(t => t.id === projectId ? { ...t, activeStep: step } : t));
     };
     window.addEventListener('step', handleStep);
     return () => window.removeEventListener('step', handleStep);
   }, []);
 
-  const handlePlayToggle = () => {
-    if (!isPlaying) {
-      engine.init(); // Must be called on user interaction
+  const addNewTab = () => {
+    const newId = `tab-${Date.now()}`;
+    const newTab: TabData = {
+      id: newId,
+      name: `Arrangement ${tabs.length + 1}`,
+      slots: new Array(7).fill(null),
+      mutedSlots: new Array(7).fill(false),
+      fxSlots: new Array(7).fill(null).map(defaultFx),
+      masterFx: defaultFx(),
+      isPlaying: false,
+      activeStep: 0
+    };
+    setTabs(prev => [...prev, newTab]);
+    setActiveTabId(newId);
+  };
+
+  const togglePlayTab = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    const engine = engineManager.getProject(id);
+    const tab = tabs.find(t => t.id === id);
+    if (!tab) return;
+    
+    if (!tab.isPlaying) {
       engine.play();
-      setIsPlaying(true);
+      setTabs(prev => prev.map(t => t.id === id ? { ...t, isPlaying: true } : t));
     } else {
       engine.stop();
-      setIsPlaying(false);
-      setActiveStep(0);
+      setTabs(prev => prev.map(t => t.id === id ? { ...t, isPlaying: false, activeStep: 0 } : t));
     }
   };
 
+  const handleModuleMouseEnter = (index: number) => {
+    if (activeTab.slots[index]) {
+      clearTimeout(fxTimeoutRef.current);
+      clearTimeout(tabFxTimeoutRef.current);
+      setHoveredTabFxId(null);
+      setHoveredFxSlot(index);
+    }
+  };
+
+  const handleModuleMouseLeave = () => {
+    fxTimeoutRef.current = setTimeout(() => setHoveredFxSlot(null), 300);
+  };
+
+  const handleTabMouseEnter = (id: string) => {
+    clearTimeout(tabFxTimeoutRef.current);
+    clearTimeout(fxTimeoutRef.current);
+    setHoveredFxSlot(null);
+    setHoveredTabFxId(id);
+  };
+
+  const handleTabMouseLeave = () => {
+    tabFxTimeoutRef.current = setTimeout(() => setHoveredTabFxId(null), 300);
+  };
+
+  const handleFxChange = (key: keyof FxParams, value: number) => {
+    if (hoveredFxSlot === null) return;
+    
+    const newFx = [...activeTab.fxSlots];
+    newFx[hoveredFxSlot] = { ...newFx[hoveredFxSlot], [key]: value };
+    
+    setTabs(prev => prev.map(t => t.id === activeTab.id ? { ...t, fxSlots: newFx } : t));
+    engineManager.getProject(activeTab.id).setFxParams(hoveredFxSlot, newFx[hoveredFxSlot]);
+  };
+
+  const handleMasterFxChange = (key: keyof FxParams, value: number) => {
+    if (!hoveredTabFxId) return;
+    
+    setTabs(prev => prev.map(t => {
+      if (t.id === hoveredTabFxId) {
+        const newFx = { ...t.masterFx, [key]: value };
+        engineManager.getProject(hoveredTabFxId).setMasterFxParams(newFx);
+        return { ...t, masterFx: newFx };
+      }
+      return t;
+    }));
+  };
+
+  const handleResetFx = () => {
+    if (hoveredFxSlot === null) return;
+    const resetValues = defaultFx();
+    const newFx = [...activeTab.fxSlots];
+    newFx[hoveredFxSlot] = resetValues;
+    
+    setTabs(prev => prev.map(t => t.id === activeTab.id ? { ...t, fxSlots: newFx } : t));
+    engineManager.getProject(activeTab.id).setFxParams(hoveredFxSlot, resetValues);
+  };
+
+  const handleResetMasterFx = () => {
+    if (!hoveredTabFxId) return;
+    const resetValues = defaultFx();
+    
+    setTabs(prev => prev.map(t => {
+      if (t.id === hoveredTabFxId) {
+        engineManager.getProject(hoveredTabFxId).setMasterFxParams(resetValues);
+        return { ...t, masterFx: resetValues };
+      }
+      return t;
+    }));
+  };
+
   const toggleMute = (index: number) => {
-    if (!slots[index]) return;
-    const newMuted = [...mutedSlots];
+    if (!activeTab.slots[index]) return;
+    const newMuted = [...activeTab.mutedSlots];
     newMuted[index] = !newMuted[index];
-    setMutedSlots(newMuted);
-    engine.setMutedSlots(newMuted);
+    
+    setTabs(prev => prev.map(t => t.id === activeTab.id ? { ...t, mutedSlots: newMuted } : t));
+    engineManager.getProject(activeTab.id).setMutedSlots(newMuted);
   };
 
   const handleDragStart = (e: React.DragEvent, item: SoundDef) => {
-    // We need to handle the buffer separately if it exists, or just pass IDs.
-    // For simplicity, we'll stringify but remember buffers are held in a global pool or reference.
-    // Actually, since we are in a SPA, we can just pass the sound object if it's already in our state.
-    const cleanItem = { ...item, buffer: undefined }; // Can't stringify buffers
+    const cleanItem = { ...item, buffer: undefined }; 
     e.dataTransfer.setData('application/json', JSON.stringify(cleanItem));
     e.dataTransfer.effectAllowed = 'copy';
   };
@@ -60,19 +174,20 @@ export default function App() {
       const data = e.dataTransfer.getData('application/json');
       const itemData = JSON.parse(data) as SoundDef;
       
-      // Look up recorded sound if it's custom
       let item = AVAILABLE_SOUNDS.find(s => s.id === itemData.id) || recordedSounds.find(s => s.id === itemData.id);
       
       if (!item) return;
 
-      const newSlots = [...slots];
+      const newSlots = [...activeTab.slots];
       newSlots[slotIndex] = item;
-      setSlots(newSlots);
+      
+      setTabs(prev => prev.map(t => t.id === activeTab.id ? { ...t, slots: newSlots } : t));
+      const engine = engineManager.getProject(activeTab.id);
       engine.setSlots(newSlots);
       
-      // Auto play on first drop if not playing
-      if (!isPlaying) {
-         handlePlayToggle();
+      if (!activeTab.isPlaying) {
+         engine.play();
+         setTabs(prev => prev.map(t => t.id === activeTab.id ? { ...t, isPlaying: true } : t));
       }
     } catch (err) {
       console.error('Drop error', err);
@@ -85,10 +200,38 @@ export default function App() {
   };
 
   const handleClearSlot = (index: number) => {
-    const newSlots = [...slots];
+    const newSlots = [...activeTab.slots];
     newSlots[index] = null;
-    setSlots(newSlots);
-    engine.setSlots(newSlots);
+    setTabs(prev => prev.map(t => t.id === activeTab.id ? { ...t, slots: newSlots } : t));
+    engineManager.getProject(activeTab.id).setSlots(newSlots);
+  };
+
+  const toggleLoopMode = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    setRecordedSounds(prev => prev.map(s => {
+      if (s.id !== id) return s;
+      const newMode = s.loopMode === 'fast' ? 'full' : 'fast';
+      return {
+        ...s,
+        loopMode: newMode,
+        pattern: newMode === 'fast' ? new Array(16).fill({ note: 1 }) : [{ note: 1 }, ...new Array(15).fill({})]
+      };
+    }));
+    
+    // Update active slots
+    const newSlots = activeTab.slots.map(slot => {
+      if (slot && slot.id === id) {
+        const newMode = slot.loopMode === 'fast' ? 'full' : 'fast';
+        return {
+          ...slot,
+          loopMode: newMode,
+          pattern: newMode === 'fast' ? new Array(16).fill({ note: 1 }) : [{ note: 1 }, ...new Array(15).fill({})]
+        };
+      }
+      return slot;
+    });
+    setTabs(prev => prev.map(t => t.id === activeTab.id ? { ...t, slots: newSlots } : t));
+    engineManager.getProject(activeTab.id).setSlots(newSlots);
   };
 
   // Recording & Upload Logic
@@ -99,20 +242,17 @@ export default function App() {
       mediaRecorderRef.current = recorder;
       audioChunksRef.current = [];
 
-      recorder.ondataavailable = (e) => {
-        audioChunksRef.current.push(e.data);
-      };
+      recorder.ondataavailable = (e) => audioChunksRef.current.push(e.data);
 
       recorder.onstop = async () => {
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
         const arrayBuffer = await audioBlob.arrayBuffer();
         
-        engine.init();
-        if (engine.ctx) {
+        engineManager.init();
+        if (engineManager.ctx) {
           try {
-            const rawBuffer = await engine.ctx.decodeAudioData(arrayBuffer);
-            // Process the recording to fit the loop
-            const processedBuffer = await engine.processBuffer(rawBuffer);
+            const rawBuffer = await engineManager.ctx.decodeAudioData(arrayBuffer);
+            const processedBuffer = await engineManager.processBuffer(rawBuffer);
             
             const newSound: SoundDef = {
               id: `rec-${Date.now()}`,
@@ -121,7 +261,7 @@ export default function App() {
               color: 'bg-pink-500',
               pattern: [{ note: 1 }, ...new Array(15).fill({})], 
               buffer: processedBuffer,
-              loopMode: 'full' // default to full/smart loop for better alignment
+              loopMode: 'full' 
             };
             setRecordedSounds(prev => [...prev, newSound]);
           } catch (err) {
@@ -152,11 +292,10 @@ export default function App() {
 
     try {
       const arrayBuffer = await file.arrayBuffer();
-      engine.init();
-      if (engine.ctx) {
-        const rawBuffer = await engine.ctx.decodeAudioData(arrayBuffer);
-        // Requirement 1-5: Intelligent BPM detect, stretch, align, seamless loop
-        const processedBuffer = await engine.processBuffer(rawBuffer);
+      engineManager.init();
+      if (engineManager.ctx) {
+        const rawBuffer = await engineManager.ctx.decodeAudioData(arrayBuffer);
+        const processedBuffer = await engineManager.processBuffer(rawBuffer);
         
         const newSound: SoundDef = {
           id: `upload-${Date.now()}`,
@@ -175,35 +314,6 @@ export default function App() {
     event.target.value = '';
   };
 
-  const toggleLoopMode = (e: React.MouseEvent, id: string) => {
-    e.stopPropagation();
-    setRecordedSounds(prev => prev.map(s => {
-      if (s.id !== id) return s;
-      const newMode = s.loopMode === 'fast' ? 'full' : 'fast';
-      return {
-        ...s,
-        loopMode: newMode,
-        pattern: newMode === 'fast' ? new Array(16).fill({ note: 1 }) : [{ note: 1 }, ...new Array(15).fill({})]
-      };
-    }));
-    
-    // Update active slots
-    const newSlots = slots.map(slot => {
-      if (slot && slot.id === id) {
-        const newMode = slot.loopMode === 'fast' ? 'full' : 'fast';
-        return {
-          ...slot,
-          loopMode: newMode,
-          pattern: newMode === 'fast' ? new Array(16).fill({ note: 1 }) : [{ note: 1 }, ...new Array(15).fill({})]
-        };
-      }
-      return slot;
-    });
-    setSlots(newSlots);
-    engine.setSlots(newSlots);
-  };
-
-  // Group sounds by category
   const categories = [
     { id: 'beat', name: 'Beats' },
     { id: 'effect', name: 'Effects' },
@@ -213,43 +323,83 @@ export default function App() {
     { id: 'custom', name: 'Custom / Recorded' },
   ];
 
+  const fxConfig: { key: keyof FxParams; name: string; min: number; max: number }[] = [
+    { key: 'lpf', name: 'DJ Lowpass', min: 0, max: 100 },
+    { key: 'hpf', name: 'Highpass', min: 0, max: 100 },
+    { key: 'volume', name: 'Fade Vol', min: 0, max: 100 },
+    { key: 'sidechain', name: 'Ducking', min: 0, max: 100 },
+    { key: 'reverb', name: 'Reverb', min: 0, max: 100 },
+    { key: 'delay', name: 'Echo', min: 0, max: 100 },
+    { key: 'pitch', name: 'Speed/Pitch', min: -12, max: 12 },
+    { key: 'panSwing', name: 'Pan Swing', min: 0, max: 100 },
+    { key: 'compressor', name: 'Compressor', min: 0, max: 100 },
+    { key: 'flanger', name: 'Flanger', min: 0, max: 100 },
+  ];
+
   return (
     <div className="h-screen bg-[#0c0c0e] text-zinc-300 font-sans flex flex-col overflow-hidden select-none">
       
-      {/* Header / Transport */}
-      <header className="h-16 px-8 flex flex-shrink-0 items-center justify-between border-b border-white/5 bg-black/40 backdrop-blur-md z-10 w-full">
-        <div className="flex items-center gap-4">
-          <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
-            <div className="w-1 h-4 bg-white rounded-full mx-0.5"></div>
-            <div className="w-1 h-2 bg-white rounded-full mx-0.5"></div>
-            <div className="w-1 h-5 bg-white rounded-full mx-0.5"></div>
+      {/* Header / Tabs */}
+      <header className="px-6 flex flex-shrink-0 items-end justify-between border-b border-white/5 bg-black/40 backdrop-blur-md z-10 w-full pt-4">
+        <div className="flex items-center gap-2 overflow-x-auto scrollbar-none pb-0 w-full md:w-auto">
+          {tabs.map((tab) => (
+             <div 
+               key={tab.id}
+               onClick={() => setActiveTabId(tab.id)}
+               onMouseEnter={() => handleTabMouseEnter(tab.id)}
+               onMouseLeave={handleTabMouseLeave}
+               className={cn(
+                 "group relative flex items-center gap-3 px-4 py-3 rounded-t-lg font-bold tracking-widest uppercase text-[10px] cursor-pointer transition-all border border-b-0 min-w-max",
+                 activeTabId === tab.id ? "bg-zinc-900 border-white/10 text-white" : "bg-black/20 border-transparent text-zinc-500 hover:text-zinc-300 hover:bg-black/40"
+               )}
+             >
+                <button 
+                  onClick={(e) => togglePlayTab(e, tab.id)}
+                  className={cn(
+                    "w-5 h-5 rounded flex items-center justify-center transition-colors",
+                    tab.isPlaying ? "bg-emerald-500 text-white shadow-[0_0_10px_rgba(16,185,129,0.3)]" : "bg-white/10 text-white hover:bg-white/20"
+                  )}
+                >
+                  {tab.isPlaying ? <Square className="w-2.5 h-2.5" fill="currentColor"/> : <Play className="w-2.5 h-2.5" fill="currentColor" className="ml-0.5"/>}
+                </button>
+                <span>{tab.name}</span>
+                <span className="flex gap-0.5 w-3 mt-0.5 opacity-80">
+                  {tab.isPlaying && (
+                     <>
+                       <span className="w-0.5 h-1.5 bg-emerald-400 rounded-full animate-pulse"></span>
+                       <span className="w-0.5 h-2 bg-emerald-400 rounded-full animate-pulse delay-75"></span>
+                       <span className="w-0.5 h-1.5 bg-emerald-400 rounded-full animate-pulse delay-150"></span>
+                     </>
+                  )}
+                </span>
+             </div>
+          ))}
+
+          <button 
+             onClick={addNewTab}
+             className="px-4 py-3 rounded-t-lg bg-black/20 hover:bg-black/40 text-zinc-500 hover:text-zinc-300 transition-colors uppercase tracking-widest text-[10px] font-bold border border-transparent flex items-center gap-1.5 ml-2"
+          >
+             <Plus size={12} strokeWidth={3} />
+             New
+          </button>
+        </div>
+
+        <div className="hidden md:flex items-center gap-6 text-[10px] font-medium uppercase tracking-widest opacity-60 pb-3 h-full mb-1">
+          <div className="flex gap-4 bg-white/5 px-3 py-1.5 rounded text-white flex-shrink-0">
+             <span>BPM: 120</span>
+             <span className="text-white/20">|</span>
+             <span>KEY: C MAJ</span>
+             <span className="text-white/20">|</span>
+             <span className="w-20 text-right">STEP: {activeTab.activeStep + 1}/16</span>
           </div>
-          <h1 className="text-lg font-bold tracking-tight text-white uppercase">Flux Audio Workstation</h1>
         </div>
-
-        <div className="flex items-center gap-6 text-xs font-medium uppercase tracking-widest opacity-60">
-          <div>BPM: 120</div>
-          <div>KEY: C MAJ</div>
-          <div>STEP: {activeStep + 1}/16</div>
-        </div>
-
-        <button 
-          onClick={handlePlayToggle}
-          className={cn(
-            "flex items-center gap-2 px-6 py-2 rounded font-bold transition-all text-xs tracking-widest uppercase",
-            isPlaying ? "bg-emerald-500 hover:bg-emerald-600 text-white shadow-[0_0_20px_rgba(16,185,129,0.4)]" : "bg-white/10 hover:bg-white/20 border border-white/5 text-white"
-          )}
-        >
-          {isPlaying ? <Square className="w-4 h-4" fill="currentColor"/> : <Play className="w-4 h-4" fill="currentColor"/>}
-          {isPlaying ? 'STOP' : 'PLAY'}
-        </button>
       </header>
 
       {/* Main Content Area */}
       <main className="flex-1 w-full flex flex-col p-6 gap-6 overflow-hidden">
         
         {/* TOP: Performance Modules (Drop Zones) */}
-        <section className="flex-1 bg-zinc-900/50 rounded-2xl border border-white/5 p-8 flex flex-col overflow-hidden">
+        <section className="flex-1 bg-zinc-900/50 rounded-2xl border border-white/5 p-8 flex flex-col overflow-hidden relative">
           <div className="flex items-center justify-between mb-6">
             <h2 className="text-sm font-bold uppercase tracking-widest text-zinc-500">Performance Matrix (Drop Zone)</h2>
             <div className="flex gap-4">
@@ -257,17 +407,17 @@ export default function App() {
                 Tips: Click module to MUTE
               </span>
               <span className="flex items-center gap-2 text-[10px] text-emerald-400 font-bold uppercase tracking-widest">
-                <span className={cn("w-1.5 h-1.5 rounded-full bg-emerald-400", isPlaying ? "animate-pulse" : "")}></span>
-                {isPlaying ? "Playing" : "Ready To Play"}
+                <span className={cn("w-1.5 h-1.5 rounded-full bg-emerald-400", activeTab.isPlaying ? "animate-pulse" : "")}></span>
+                {activeTab.isPlaying ? "Playing" : "Ready To Play"}
               </span>
             </div>
           </div>
 
           <div className="flex-1 flex items-center justify-center overflow-x-auto py-4">
             <div className="flex gap-2 sm:gap-3 justify-center flex-nowrap min-w-max">
-              {slots.map((slot, index) => {
-                const isPlayingNow = isPlaying && slot && slot.pattern[activeStep] && (slot.pattern[activeStep].note || slot.pattern[activeStep].drum);
-                const isMuted = mutedSlots[index];
+              {activeTab.slots.map((slot, index) => {
+                const isPlayingNow = activeTab.isPlaying && slot && slot.pattern[activeTab.activeStep] && (slot.pattern[activeTab.activeStep].note || slot.pattern[activeTab.activeStep].drum || slot.pattern[activeTab.activeStep].exp);
+                const isMuted = activeTab.mutedSlots[index];
 
                 return (
                   <div 
@@ -275,6 +425,8 @@ export default function App() {
                     onDrop={(e) => handleDrop(e, index)}
                     onDragOver={handleDragOver}
                     onClick={() => toggleMute(index)}
+                    onMouseEnter={() => handleModuleMouseEnter(index)}
+                    onMouseLeave={handleModuleMouseLeave}
                     className={cn(
                       "relative w-14 h-32 sm:w-20 sm:h-44 lg:w-24 lg:h-56 rounded-xl border-2 flex flex-col items-center justify-end pb-2 transition-all overflow-hidden cursor-pointer",
                       slot ? (isMuted ? 'border-white/5 bg-zinc-900' : 'border-white/20 bg-zinc-800 shadow-xl') : 'bg-white/5 border-white/10 border-dashed hover:bg-white/10'
@@ -313,7 +465,7 @@ export default function App() {
                     </AnimatePresence>
                     
                     {/* Visualizer Backdrop */}
-                    {slot && isPlaying && !isMuted && (
+                    {slot && activeTab.isPlaying && !isMuted && (
                       <motion.div 
                         className={cn("absolute inset-x-0 bottom-0 opacity-20", slot.color)}
                         animate={{ height: isPlayingNow ? '100%' : '10%' }}
@@ -332,6 +484,108 @@ export default function App() {
             </div>
           </div>
         </section>
+
+        {/* Fx Panel - Slot Level */}
+        <AnimatePresence>
+          {hoveredFxSlot !== null && activeTab.slots[hoveredFxSlot] && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 10 }}
+              onMouseEnter={() => clearTimeout(fxTimeoutRef.current)}
+              onMouseLeave={handleModuleMouseLeave}
+              className="absolute z-50 left-0 right-0 top-[50%] lg:top-[60%] mx-auto w-[95%] max-w-5xl bg-zinc-950/95 backdrop-blur-xl border border-white/10 rounded-2xl p-6 shadow-2xl flex flex-col gap-5 pointer-events-auto"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <h3 className="text-xs font-bold text-white uppercase tracking-widest flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                    Module FX: {activeTab.slots[hoveredFxSlot]?.name} (Slot {hoveredFxSlot + 1})
+                  </h3>
+                  <button 
+                    onClick={handleResetFx}
+                    className="px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 text-[9px] font-bold text-emerald-400 uppercase tracking-tighter transition-colors border border-emerald-500/20"
+                  >
+                    Reset FX
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-x-8 gap-y-6">
+                {fxConfig.map(cfg => (
+                  <div key={cfg.key} className="flex flex-col gap-2">
+                     <div className="flex justify-between items-end">
+                        <span className="text-[10px] text-zinc-400 uppercase tracking-wider">{cfg.name}</span>
+                        <span className="text-[10px] text-zinc-300 font-mono bg-white/5 px-1.5 py-0.5 rounded flex-shrink-0 min-w-[28px] text-center">
+                           {activeTab.fxSlots[hoveredFxSlot][cfg.key]}
+                        </span>
+                     </div>
+                     <input 
+                        type="range"
+                        min={cfg.min}
+                        max={cfg.max}
+                        value={activeTab.fxSlots[hoveredFxSlot][cfg.key]}
+                        onChange={(e) => handleFxChange(cfg.key, parseFloat(e.target.value))}
+                        className="w-full h-1.5 focus:outline-none appearance-none bg-zinc-800 rounded-lg cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:bg-emerald-500 [&::-webkit-slider-thumb]:rounded-full"
+                     />
+                  </div>
+                ))}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Fx Panel - Master/Tab Level */}
+        <AnimatePresence>
+          {hoveredTabFxId !== null && (
+            <motion.div
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              onMouseEnter={() => clearTimeout(tabFxTimeoutRef.current)}
+              onMouseLeave={handleTabMouseLeave}
+              className="absolute z-50 left-0 right-0 top-16 mx-auto w-[95%] max-w-5xl bg-indigo-950/95 backdrop-blur-xl border border-indigo-500/30 rounded-b-2xl p-6 shadow-2xl flex flex-col gap-5 pointer-events-auto"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <h3 className="text-xs font-bold text-white uppercase tracking-widest flex items-center gap-2 text-indigo-300">
+                    <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>
+                    Master FX: {tabs.find(t => t.id === hoveredTabFxId)?.name}
+                  </h3>
+                  <button 
+                    onClick={handleResetMasterFx}
+                    className="px-2 py-0.5 rounded bg-indigo-500/10 hover:bg-indigo-500/20 text-[9px] font-bold text-indigo-300 uppercase tracking-tighter transition-colors border border-indigo-500/30"
+                  >
+                    Reset Global
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-x-8 gap-y-6">
+                {fxConfig.map(cfg => {
+                  const t = tabs.find(t => t.id === hoveredTabFxId);
+                  if (!t) return null;
+                  return (
+                    <div key={cfg.key} className="flex flex-col gap-2">
+                       <div className="flex justify-between items-end">
+                          <span className="text-[10px] text-indigo-300/80 uppercase tracking-wider">{cfg.name}</span>
+                          <span className="text-[10px] text-indigo-200 font-mono bg-indigo-900/50 px-1.5 py-0.5 rounded flex-shrink-0 min-w-[28px] text-center">
+                             {t.masterFx[cfg.key]}
+                          </span>
+                       </div>
+                       <input 
+                          type="range"
+                          min={cfg.min}
+                          max={cfg.max}
+                          value={t.masterFx[cfg.key]}
+                          onChange={(e) => handleMasterFxChange(cfg.key, parseFloat(e.target.value))}
+                          className="w-full h-1.5 focus:outline-none appearance-none bg-indigo-950/50 rounded-lg cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:bg-indigo-400 [&::-webkit-slider-thumb]:rounded-full outline border border-indigo-800/50"
+                       />
+                    </div>
+                  );
+                })}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* BOTTOM: Music Modules (Draggable Sounds) */}
         <section className="h-56 flex flex-col gap-2 shrink-0">

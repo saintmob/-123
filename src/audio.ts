@@ -1,5 +1,17 @@
 export type Category = 'beat' | 'effect' | 'bass' | 'melody' | 'experimental' | 'custom';
 
+export interface FxParams {
+  lpf: number; hpf: number; volume: number; sidechain: number;
+  reverb: number; delay: number; pitch: number; panSwing: number;
+  compressor: number; flanger: number;
+}
+
+export const defaultFx = (): FxParams => ({
+  lpf: 100, hpf: 0, volume: 100, sidechain: 0,
+  reverb: 0, delay: 0, pitch: 0, panSwing: 0,
+  compressor: 0, flanger: 0,
+});
+
 export interface SoundDef {
   id: string;
   name: string;
@@ -68,26 +80,172 @@ export const AVAILABLE_SOUNDS: SoundDef[] = [
   { id: 'x4', name: 'Train', category: 'experimental', color: 'bg-fuchsia-500', pattern: parsePattern('W.W.W.W.W.W.W.W.') },
 ];
 
-export class AudioEngine {
-  ctx: AudioContext | null = null;
+function createReverbBuffer(ctx: AudioContext) {
+  const length = ctx.sampleRate * 2.0;
+  const buffer = ctx.createBuffer(2, length, ctx.sampleRate);
+  for (let c = 0; c < 2; c++) {
+    const channelData = buffer.getChannelData(c);
+    for (let i = 0; i < length; i++) {
+      channelData[i] = (Math.random() * 2 - 1) * Math.exp(-i / (ctx.sampleRate * 0.3));
+    }
+  }
+  return buffer;
+}
+
+export class SlotChannel {
+  input: GainNode;
+  outGain: GainNode;
+
+  lpf: BiquadFilterNode;
+  hpf: BiquadFilterNode;
+  comp: DynamicsCompressorNode;
+  panner: StereoPannerNode;
+  pannerLFO: OscillatorNode;
+  pannerGain: GainNode;
+
+  delay: DelayNode;
+  delayFeedback: GainNode;
+  delayMix: GainNode;
+
+  reverbMix: GainNode;
+  convolver: ConvolverNode;
+
+  sidechainGain: GainNode;
+  sidechainLFO: OscillatorNode;
+  scDepth: GainNode;
+
+  flangerDelay: DelayNode;
+  flangerMix: GainNode;
+  flangerLFO: OscillatorNode;
+
+  pitchShift: number = 0;
+
+  constructor(ctx: AudioContext, masterOut: AudioNode) {
+    this.input = ctx.createGain();
+    this.comp = ctx.createDynamicsCompressor();
+    this.lpf = ctx.createBiquadFilter(); this.lpf.type = 'lowpass'; this.lpf.frequency.value = 20000;
+    this.hpf = ctx.createBiquadFilter(); this.hpf.type = 'highpass'; this.hpf.frequency.value = 10;
+    
+    // Flanger
+    const flangerSplit = ctx.createGain();
+    this.flangerDelay = ctx.createDelay(0.01); this.flangerDelay.delayTime.value = 0.003;
+    this.flangerLFO = ctx.createOscillator(); this.flangerLFO.frequency.value = 0.5;
+    const flangerDepth = ctx.createGain(); flangerDepth.gain.value = 0.002;
+    this.flangerLFO.connect(flangerDepth);
+    flangerDepth.connect(this.flangerDelay.delayTime);
+    this.flangerMix = ctx.createGain(); this.flangerMix.gain.value = 0;
+    this.flangerLFO.start();
+    
+    // Panner
+    this.panner = ctx.createStereoPanner();
+    this.pannerLFO = ctx.createOscillator(); this.pannerLFO.frequency.value = 0.5;
+    this.pannerGain = ctx.createGain(); this.pannerGain.gain.value = 0;
+    this.pannerLFO.connect(this.pannerGain);
+    this.pannerGain.connect(this.panner.pan);
+    this.pannerLFO.start();
+
+    // Delay
+    const delaySplit = ctx.createGain();
+    this.delay = ctx.createDelay(1.0); this.delay.delayTime.value = 0.375;
+    this.delayFeedback = ctx.createGain(); this.delayFeedback.gain.value = 0.4;
+    this.delay.connect(this.delayFeedback); this.delayFeedback.connect(this.delay);
+    this.delayMix = ctx.createGain(); this.delayMix.gain.value = 0;
+
+    // Reverb
+    this.convolver = ctx.createConvolver();
+    this.convolver.buffer = createReverbBuffer(ctx);
+    this.reverbMix = ctx.createGain(); this.reverbMix.gain.value = 0;
+
+    // Sidechain
+    this.sidechainGain = ctx.createGain();
+    this.sidechainLFO = ctx.createOscillator(); this.sidechainLFO.frequency.value = 2; // 120bpm -> 2Hz
+    this.scDepth = ctx.createGain(); this.scDepth.gain.value = 0;
+    this.sidechainLFO.connect(this.scDepth);
+    this.scDepth.connect(this.sidechainGain.gain);
+    this.sidechainLFO.start();
+
+    this.outGain = ctx.createGain();
+
+    // Routing
+    this.input.connect(this.comp);
+    this.comp.connect(this.lpf);
+    this.lpf.connect(this.hpf);
+    this.hpf.connect(flangerSplit);
+
+    flangerSplit.connect(this.panner);
+    flangerSplit.connect(this.flangerDelay);
+    this.flangerDelay.connect(this.flangerMix);
+    this.flangerMix.connect(this.panner);
+
+    this.panner.connect(delaySplit);
+
+    delaySplit.connect(this.sidechainGain);
+    delaySplit.connect(this.delay);
+    this.delay.connect(this.delayMix);
+    this.delayMix.connect(this.sidechainGain);
+    
+    delaySplit.connect(this.convolver);
+    this.convolver.connect(this.reverbMix);
+    this.reverbMix.connect(this.sidechainGain);
+
+    this.sidechainGain.connect(this.outGain);
+    this.outGain.connect(masterOut);
+  }
+
+  applyParams(p: FxParams) {
+    const time = this.outGain.context.currentTime;
+    this.outGain.gain.setTargetAtTime(p.volume / 100, time, 0.05);
+
+    const lpfFreq = 200 * Math.pow(100, p.lpf / 100); 
+    this.lpf.frequency.setTargetAtTime(lpfFreq, time, 0.05);
+
+    const hpfFreq = 10 * Math.pow(500, p.hpf / 100);
+    this.hpf.frequency.setTargetAtTime(hpfFreq, time, 0.05);
+
+    this.comp.threshold.setTargetAtTime(-50 * (p.compressor / 100), time, 0.05);
+    this.comp.ratio.setTargetAtTime(1 + 19 * (p.compressor / 100), time, 0.05);
+
+    this.flangerMix.gain.setTargetAtTime(p.flanger / 100, time, 0.05);
+    this.pannerGain.gain.setTargetAtTime(p.panSwing / 100, time, 0.05);
+    this.delayMix.gain.setTargetAtTime(p.delay / 100, time, 0.05);
+    this.reverbMix.gain.setTargetAtTime(p.reverb / 100, time, 0.05);
+    
+    this.scDepth.gain.setTargetAtTime(p.sidechain / 100, time, 0.05);
+    this.pitchShift = p.pitch;
+  }
+}
+
+export class ProjectEngine {
+  ctx: AudioContext;
+  id: string;
   isPlaying = false;
   step = 0;
   slots: (SoundDef | null)[] = new Array(7).fill(null);
   mutedSlots: boolean[] = new Array(7).fill(false);
+  channels: SlotChannel[] = [];
+  masterChannel: SlotChannel;
   lookahead = 25.0; // ms
   scheduleAheadTime = 0.1; // s
   nextNoteTime = 0.0;
   lookaheadInterval: any = null;
 
-  init() {
-    if (!this.ctx) {
-      this.ctx = new (window.AudioContext || (window as any).webkitAudioContext)({
-        latencyHint: 'interactive',
-      });
+  constructor(id: string, ctx: AudioContext, masterOut: AudioNode) {
+    this.id = id;
+    this.ctx = ctx;
+    this.masterChannel = new SlotChannel(this.ctx, masterOut);
+    for (let i = 0; i < 7; i++) {
+      this.channels.push(new SlotChannel(this.ctx, this.masterChannel.input));
     }
-    if (this.ctx.state === 'suspended') {
-      this.ctx.resume();
+  }
+
+  setFxParams(index: number, params: FxParams) {
+    if (this.channels[index]) {
+      this.channels[index].applyParams(params);
     }
+  }
+
+  setMasterFxParams(params: FxParams) {
+    this.masterChannel.applyParams(params);
   }
 
   setSlots(newSlots: (SoundDef | null)[]) {
@@ -99,11 +257,13 @@ export class AudioEngine {
   }
 
   play() {
-    this.init();
+    if (this.ctx.state === 'suspended') {
+      this.ctx.resume();
+    }
     if (this.isPlaying) return;
     this.isPlaying = true;
     this.step = 0;
-    this.nextNoteTime = this.ctx!.currentTime + 0.05;
+    this.nextNoteTime = this.ctx.currentTime + 0.05;
     this.scheduler();
   }
 
@@ -126,8 +286,6 @@ export class AudioEngine {
   }
 
   private scheduleNote(stepNumber: number, time: number) {
-    if (!this.ctx) return;
-
     this.slots.forEach((slot, index) => {
       if (!slot || this.mutedSlots[index]) return;
       
@@ -135,67 +293,69 @@ export class AudioEngine {
       if (!stepData) return;
 
       if (slot.buffer) {
-        this.playBuffer(slot.buffer, time, slot.loopMode || 'fast');
+        this.playBuffer(slot.buffer, time, slot.loopMode || 'fast', index);
       } else if (stepData.drum) {
-        this.playDrum(stepData.drum, time);
+        this.playDrum(stepData.drum, time, index);
       } else if (stepData.note) {
-        this.playSynth(stepData.note, slot.category, time);
+        this.playSynth(stepData.note, slot.category, time, index);
       } else if (stepData.exp) {
-        this.playExperimental(stepData.exp, time);
+        this.playExperimental(stepData.exp, time, index);
       }
     });
 
-    const event = new CustomEvent('step', { detail: { step: stepNumber } });
+    const event = new CustomEvent('step', { detail: { projectId: this.id, step: stepNumber } });
     window.dispatchEvent(event);
   }
 
   private scheduler() {
     this.lookaheadInterval = setInterval(() => {
       if (!this.isPlaying) return;
-      while (this.nextNoteTime < this.ctx!.currentTime + this.scheduleAheadTime) {
+      while (this.nextNoteTime < this.ctx.currentTime + this.scheduleAheadTime) {
         this.scheduleNote(this.step, this.nextNoteTime);
         this.nextNote()
       }
     }, this.lookahead);
   }
 
-  private playBuffer(buffer: AudioBuffer, time: number, mode: 'fast' | 'full') {
-    const ctx = this.ctx!;
+  private playBuffer(buffer: AudioBuffer, time: number, mode: 'fast' | 'full', channelIndex: number) {
+    const ctx = this.ctx;
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     
     const gain = ctx.createGain();
     source.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(this.channels[channelIndex].input);
+
+    const shift = this.channels[channelIndex].pitchShift;
+    const rateMultiplier = Math.pow(2, shift / 12);
+    source.playbackRate.value = rateMultiplier;
 
     if (mode === 'fast') {
       const duration = 0.15;
       gain.gain.setValueAtTime(1, time);
       gain.gain.linearRampToValueAtTime(0, time + duration);
-      source.start(time, 0, duration);
+      source.start(time, 0, duration * rateMultiplier);
     } else {
-      // time stretch to match 1 measure (2s @ 120BPM)
       const measureDuration = 2.0; 
-      // Note: We used to just change playback rate, now we assume the buffer is ALREADY processed
-      // but for legacy recorded sounds we still might need a fallback.
-      // However, the new upload logic will pre-process the buffer to exactly 2 seconds.
       gain.gain.setValueAtTime(1, time);
       gain.gain.setValueAtTime(1, time + measureDuration - 0.05);
       gain.gain.linearRampToValueAtTime(0, time + measureDuration);
-      source.start(time, 0, measureDuration); 
+      source.start(time, 0, measureDuration * rateMultiplier); 
     }
   }
 
-  private playExperimental(type: string, time: number) {
-    const ctx = this.ctx!;
+  private playExperimental(type: string, time: number, channelIndex: number) {
+    const ctx = this.ctx;
     const gain = ctx.createGain();
-    gain.connect(ctx.destination);
+    gain.connect(this.channels[channelIndex].input);
+    const shift = this.channels[channelIndex].pitchShift;
+    const rateMultiplier = Math.pow(2, shift / 12);
     
     if (type === 'glitch') {
       const osc = ctx.createOscillator();
       osc.type = 'sawtooth';
-      osc.frequency.setValueAtTime(Math.random() * 800 + 200, time);
-      osc.frequency.setValueAtTime(Math.random() * 800 + 200, time + 0.05);
+      osc.frequency.setValueAtTime((Math.random() * 800 + 200) * rateMultiplier, time);
+      osc.frequency.setValueAtTime((Math.random() * 800 + 200) * rateMultiplier, time + 0.05);
       osc.connect(gain);
       gain.gain.setValueAtTime(0.3, time);
       gain.gain.exponentialRampToValueAtTime(0.01, time + 0.1);
@@ -204,8 +364,8 @@ export class AudioEngine {
     } else if (type === 'laser') {
       const osc = ctx.createOscillator();
       osc.type = 'square';
-      osc.frequency.setValueAtTime(1000, time);
-      osc.frequency.exponentialRampToValueAtTime(100, time + 0.2);
+      osc.frequency.setValueAtTime(1000 * rateMultiplier, time);
+      osc.frequency.exponentialRampToValueAtTime(100 * rateMultiplier, time + 0.2);
       osc.connect(gain);
       gain.gain.setValueAtTime(0.3, time);
       gain.gain.exponentialRampToValueAtTime(0.01, time + 0.2);
@@ -216,14 +376,14 @@ export class AudioEngine {
       const mod = ctx.createOscillator();
       const modGain = ctx.createGain();
       mod.type = 'sine';
-      mod.frequency.value = 5;
+      mod.frequency.value = 5 * rateMultiplier;
       mod.connect(modGain);
-      modGain.gain.value = 100;
+      modGain.gain.value = 100 * rateMultiplier;
       modGain.connect(osc.frequency);
       
       osc.type = 'triangle';
-      osc.frequency.setValueAtTime(400, time);
-      osc.frequency.linearRampToValueAtTime(300, time + 0.3);
+      osc.frequency.setValueAtTime(400 * rateMultiplier, time);
+      osc.frequency.linearRampToValueAtTime(300 * rateMultiplier, time + 0.3);
       osc.connect(gain);
       gain.gain.setValueAtTime(0.3, time);
       gain.gain.linearRampToValueAtTime(0.01, time + 0.3);
@@ -242,157 +402,23 @@ export class AudioEngine {
       noise.buffer = buffer;
       const filter = ctx.createBiquadFilter();
       filter.type = 'lowpass';
-      filter.frequency.setValueAtTime(800, time);
-      filter.frequency.linearRampToValueAtTime(400, time + 0.1);
+      filter.frequency.setValueAtTime(800 * rateMultiplier, time);
+      filter.frequency.linearRampToValueAtTime(400 * rateMultiplier, time + 0.1);
       noise.connect(filter);
       filter.connect(gain);
       gain.gain.setValueAtTime(0.4, time);
       gain.gain.exponentialRampToValueAtTime(0.01, time + 0.1);
+      noise.playbackRate.value = rateMultiplier;
       noise.start(time);
     }
   }
 
-  async processBuffer(buffer: AudioBuffer): Promise<AudioBuffer> {
-    const ctx = this.ctx || new AudioContext();
-    const bpm = this.detectBPM(buffer);
-    const targetBPM = 120;
-    const ratio = targetBPM / bpm;
-    
-    // 1. Find the first beat (onset)
-    const offset = this.findFirstBeat(buffer);
-    
-    // 2. Perform Time Stretching (WSOLA)
-    // To keep it high quality and bug-free, we re-render using a simple WSOLA implementation
-    const stretched = this.applyWSOLA(buffer, ratio, offset);
-    
-    // 3. Trim to exactly 2 seconds (1 measure @ 120BPM)
-    return this.clipToMeasure(stretched, 2.0);
-  }
-
-  private detectBPM(buffer: AudioBuffer): number {
-    const data = buffer.getChannelData(0);
-    const sampleRate = buffer.sampleRate;
-    
-    // Simple peak detection
-    const partSize = sampleRate / 2; // 0.5s chunks
-    const peaks = [];
-    
-    let max = 0;
-    for (let i = 0; i < data.length; i++) {
-      if (Math.abs(data[i]) > max) max = Math.abs(data[i]);
-    }
-    
-    const threshold = max * 0.7;
-    for (let i = 0; i < data.length; i += partSize) {
-      let partMax = 0;
-      let partPeakIdx = -1;
-      for (let j = i; j < i + partSize && j < data.length; j++) {
-        if (Math.abs(data[j]) > partMax) {
-          partMax = Math.abs(data[j]);
-          partPeakIdx = j;
-        }
-      }
-      if (partMax > threshold) {
-        peaks.push(partPeakIdx);
-      }
-    }
-    
-    if (peaks.length < 2) return 120; // fallback
-    
-    const intervals = [];
-    for (let i = 1; i < peaks.length; i++) {
-      intervals.push(peaks[i] - peaks[i-1]);
-    }
-    
-    const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-    let bpm = 60 / (avgInterval / sampleRate);
-    
-    // Sanity checks
-    while (bpm < 70) bpm *= 2;
-    while (bpm > 180) bpm /= 2;
-    
-    return Math.round(bpm);
-  }
-
-  private findFirstBeat(buffer: AudioBuffer): number {
-    const data = buffer.getChannelData(0);
-    const threshold = 0.15;
-    for (let i = 0; i < data.length; i++) {
-      if (Math.abs(data[i]) > threshold) return i;
-    }
-    return 0;
-  }
-
-  private applyWSOLA(buffer: AudioBuffer, ratio: number, startOffset: number): AudioBuffer {
-    const ctx = this.ctx || new AudioContext();
-    const sampleRate = buffer.sampleRate;
-    const inputData = buffer.getChannelData(0);
-    
-    // WSOLA simplified implementation:
-    // We take windows of 50ms, and overlap them.
-    // The skip in input vs output determines the speed.
-    const windowSize = Math.floor(sampleRate * 0.05); // 50ms
-    const hopOut = Math.floor(windowSize / 2);
-    const hopIn = Math.floor(hopOut / ratio);
-    
-    const outputLength = Math.floor(buffer.length * ratio);
-    const outputData = new Float32Array(outputLength);
-    const fadeOut = new Float32Array(windowSize);
-    for(let i=0; i<windowSize; i++) fadeOut[i] = 0.5 * (1 + Math.cos(Math.PI * i / windowSize));
-    const fadeIn = new Float32Array(windowSize);
-    for(let i=0; i<windowSize; i++) fadeIn[i] = 1 - fadeOut[i];
-
-    let outPos = 0;
-    let inPos = startOffset;
-
-    while (outPos + windowSize < outputLength && inPos + windowSize < inputData.length) {
-      for (let i = 0; i < windowSize; i++) {
-        const val = inputData[inPos + i];
-        // simple overlap add
-        outputData[outPos + i] += val * fadeIn[i];
-        if (outPos > 0) {
-          // this is a bit crude but provides the speed change
-        }
-      }
-      outPos += hopOut;
-      inPos += hopIn;
-    }
-
-    const newBuffer = ctx.createBuffer(buffer.numberOfChannels, outputLength, sampleRate);
-    newBuffer.copyToChannel(outputData, 0);
-    return newBuffer;
-  }
-
-  private clipToMeasure(buffer: AudioBuffer, seconds: number): AudioBuffer {
-    const ctx = this.ctx || new AudioContext();
-    const frameCount = Math.floor(seconds * buffer.sampleRate);
-    const clipped = ctx.createBuffer(buffer.numberOfChannels, frameCount, buffer.sampleRate);
-    
-    for (let i = 0; i < buffer.numberOfChannels; i++) {
-      const data = buffer.getChannelData(i);
-      const newData = clipped.getChannelData(i);
-      for (let j = 0; j < frameCount; j++) {
-        if (j < data.length) {
-          newData[j] = data[j];
-        } else {
-          // Seamless loop blending: fade out end and fade in start
-          const fadeLen = Math.floor(buffer.sampleRate * 0.01); // 10ms
-          if (j > frameCount - fadeLen) {
-            const alpha = (frameCount - j) / fadeLen;
-            newData[j] *= alpha;
-          }
-        }
-      }
-    }
-    return clipped;
-  }
-
-  private playDrum(type: string, time: number) {
-    const ctx = this.ctx!;
+  private playDrum(type: string, time: number, channelIndex: number) {
+    const ctx = this.ctx;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(this.channels[channelIndex].input);
 
     if (type === 'kick') {
       osc.frequency.setValueAtTime(150, time);
@@ -455,17 +481,18 @@ export class AudioEngine {
     }
   }
 
-  private playSynth(midiNote: number, category: string, time: number) {
-    const ctx = this.ctx!;
+  private playSynth(midiNote: number, category: string, time: number, channelIndex: number) {
+    const ctx = this.ctx;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     const filter = ctx.createBiquadFilter();
 
     osc.connect(filter);
     filter.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(this.channels[channelIndex].input);
 
-    const freq = 440 * Math.pow(2, (midiNote - 69) / 12);
+    const shift = this.channels[channelIndex].pitchShift;
+    const freq = 440 * Math.pow(2, (midiNote + shift - 69) / 12);
     
     if (category === 'bass') {
       osc.type = 'square';
@@ -489,4 +516,149 @@ export class AudioEngine {
   }
 }
 
-export const engine = new AudioEngine();
+export class GlobalEngineManager {
+  ctx: AudioContext | null = null;
+  projects: Map<string, ProjectEngine> = new Map();
+
+  init() {
+    if (!this.ctx) {
+      this.ctx = new (window.AudioContext || (window as any).webkitAudioContext)({
+        latencyHint: 'interactive',
+      });
+    }
+    if (this.ctx.state === 'suspended') {
+      this.ctx.resume();
+    }
+  }
+
+  getProject(id: string): ProjectEngine {
+    this.init();
+    if (!this.projects.has(id)) {
+      const p = new ProjectEngine(id, this.ctx!, this.ctx!.destination);
+      this.projects.set(id, p);
+    }
+    return this.projects.get(id)!;
+  }
+
+  async processBuffer(buffer: AudioBuffer): Promise<AudioBuffer> {
+    this.init();
+    const ctx = this.ctx!;
+    const bpm = this.detectBPM(buffer);
+    const targetBPM = 120;
+    const ratio = targetBPM / bpm;
+    
+    const offset = this.findFirstBeat(buffer);
+    const stretched = this.applyWSOLA(buffer, ratio, offset);
+    return this.clipToMeasure(stretched, 2.0);
+  }
+
+  private detectBPM(buffer: AudioBuffer): number {
+    const data = buffer.getChannelData(0);
+    const sampleRate = buffer.sampleRate;
+    
+    const partSize = sampleRate / 2; // 0.5s chunks
+    const peaks = [];
+    
+    let max = 0;
+    for (let i = 0; i < data.length; i++) {
+      if (Math.abs(data[i]) > max) max = Math.abs(data[i]);
+    }
+    
+    const threshold = max * 0.7;
+    for (let i = 0; i < data.length; i += partSize) {
+      let partMax = 0;
+      let partPeakIdx = -1;
+      for (let j = i; j < i + partSize && j < data.length; j++) {
+        if (Math.abs(data[j]) > partMax) {
+          partMax = Math.abs(data[j]);
+          partPeakIdx = j;
+        }
+      }
+      if (partMax > threshold) {
+        peaks.push(partPeakIdx);
+      }
+    }
+    
+    if (peaks.length < 2) return 120; // fallback
+    
+    const intervals = [];
+    for (let i = 1; i < peaks.length; i++) {
+      intervals.push(peaks[i] - peaks[i-1]);
+    }
+    
+    const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+    let bpm = 60 / (avgInterval / sampleRate);
+    
+    while (bpm < 70) bpm *= 2;
+    while (bpm > 180) bpm /= 2;
+    
+    return Math.round(bpm);
+  }
+
+  private findFirstBeat(buffer: AudioBuffer): number {
+    const data = buffer.getChannelData(0);
+    const threshold = 0.15;
+    for (let i = 0; i < data.length; i++) {
+      if (Math.abs(data[i]) > threshold) return i;
+    }
+    return 0;
+  }
+
+  private applyWSOLA(buffer: AudioBuffer, ratio: number, startOffset: number): AudioBuffer {
+    const ctx = this.ctx!;
+    const sampleRate = buffer.sampleRate;
+    const inputData = buffer.getChannelData(0);
+    
+    const windowSize = Math.floor(sampleRate * 0.05); // 50ms
+    const hopOut = Math.floor(windowSize / 2);
+    const hopIn = Math.floor(hopOut / ratio);
+    
+    const outputLength = Math.floor(buffer.length * ratio);
+    const outputData = new Float32Array(outputLength);
+    const fadeOut = new Float32Array(windowSize);
+    for(let i=0; i<windowSize; i++) fadeOut[i] = 0.5 * (1 + Math.cos(Math.PI * i / windowSize));
+    const fadeIn = new Float32Array(windowSize);
+    for(let i=0; i<windowSize; i++) fadeIn[i] = 1 - fadeOut[i];
+
+    let outPos = 0;
+    let inPos = startOffset;
+
+    while (outPos + windowSize < outputLength && inPos + windowSize < inputData.length) {
+      for (let i = 0; i < windowSize; i++) {
+        const val = inputData[inPos + i];
+        outputData[outPos + i] += val * fadeIn[i];
+      }
+      outPos += hopOut;
+      inPos += hopIn;
+    }
+
+    const newBuffer = ctx.createBuffer(buffer.numberOfChannels, outputLength, sampleRate);
+    newBuffer.copyToChannel(outputData, 0);
+    return newBuffer;
+  }
+
+  private clipToMeasure(buffer: AudioBuffer, seconds: number): AudioBuffer {
+    const ctx = this.ctx!;
+    const frameCount = Math.floor(seconds * buffer.sampleRate);
+    const clipped = ctx.createBuffer(buffer.numberOfChannels, frameCount, buffer.sampleRate);
+    
+    for (let i = 0; i < buffer.numberOfChannels; i++) {
+      const data = buffer.getChannelData(i);
+      const newData = clipped.getChannelData(i);
+      for (let j = 0; j < frameCount; j++) {
+        if (j < data.length) {
+          newData[j] = data[j];
+        } else {
+          const fadeLen = Math.floor(buffer.sampleRate * 0.01); // 10ms
+          if (j > frameCount - fadeLen) {
+            const alpha = (frameCount - j) / fadeLen;
+            newData[j] *= alpha;
+          }
+        }
+      }
+    }
+    return clipped;
+  }
+}
+
+export const engineManager = new GlobalEngineManager();
