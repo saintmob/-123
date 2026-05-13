@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { AVAILABLE_SOUNDS, SoundDef, engineManager, FxParams, defaultFx } from './audio';
+import { AVAILABLE_SOUNDS, SoundDef, engineManager, FxParams, defaultFx, KEYBOARD_NOTES } from './audio';
 import { cn } from './lib/utils';
 
 interface TabData {
@@ -42,6 +42,12 @@ export default function App() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Keyboard states
+  const [isKeyboardVisible, setIsKeyboardVisible] = useState(false);
+  const [isRecordingKeyboard, setIsRecordingKeyboard] = useState(false);
+  const [recordedNotes, setRecordedNotes] = useState<{time: number, note: number}[]>([]);
+  const recordStartTimeRef = useRef<number>(0);
 
   useEffect(() => {
     const handleStep = (e: any) => {
@@ -256,12 +262,13 @@ export default function App() {
             
             const newSound: SoundDef = {
               id: `rec-${Date.now()}`,
-              name: `Rec ${recordedSounds.length + 1}`,
+              name: `Voice Rec ${recordedSounds.filter(s => s.id.startsWith('rec-')).length + 1}`,
               category: 'custom',
               color: 'bg-pink-500',
-              pattern: [{ note: 1 }, ...new Array(15).fill({})], 
+              pattern: [], // Empty pattern for buffer mode
               buffer: processedBuffer,
-              loopMode: 'full' 
+              loopMode: 'full',
+              playMode: 'buffer' // Use buffer mode for direct audio playback
             };
             setRecordedSounds(prev => [...prev, newSound]);
           } catch (err) {
@@ -314,6 +321,62 @@ export default function App() {
     event.target.value = '';
   };
 
+  // Keyboard functions
+  const playKeyboardNote = (note: number) => {
+    engineManager.init();
+    if (engineManager.ctx) {
+      const osc = engineManager.ctx.createOscillator();
+      const gain = engineManager.ctx.createGain();
+      osc.frequency.value = 440 * Math.pow(2, (note - 69) / 12); // MIDI to frequency
+      gain.gain.setValueAtTime(0.3, engineManager.ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, engineManager.ctx.currentTime + 0.3);
+      osc.connect(gain);
+      gain.connect(engineManager.ctx.destination);
+      osc.start();
+      osc.stop(engineManager.ctx.currentTime + 0.3);
+    }
+  };
+
+  const startKeyboardRecording = () => {
+    setIsRecordingKeyboard(true);
+    setRecordedNotes([]);
+    recordStartTimeRef.current = Date.now();
+  };
+
+  const stopKeyboardRecording = () => {
+    setIsRecordingKeyboard(false);
+    if (recordedNotes.length > 0) {
+      // Generate pattern from recorded notes
+      const pattern = new Array(16).fill({});
+      const totalDuration = Date.now() - recordStartTimeRef.current;
+      const stepDuration = totalDuration / 16;
+      
+      recordedNotes.forEach(({time, note}) => {
+        const step = Math.floor((time - recordStartTimeRef.current) / stepDuration);
+        if (step >= 0 && step < 16) {
+          pattern[step] = { note };
+        }
+      });
+
+      const newSound: SoundDef = {
+        id: `keyboard-${Date.now()}`,
+        name: `Seq ${recordedSounds.filter(s => s.id.startsWith('keyboard-')).length + 1}`,
+        category: 'custom',
+        color: 'bg-purple-500',
+        pattern,
+        loopMode: 'full'
+      };
+      setRecordedSounds(prev => [...prev, newSound]);
+    }
+  };
+
+  const handleKeyboardKeyPress = (note: number) => {
+    playKeyboardNote(note);
+    if (isRecordingKeyboard) {
+      setRecordedNotes(prev => [...prev, { time: Date.now(), note }]);
+    }
+  };
+
   const categories = [
     { id: 'beat', name: 'Beats' },
     { id: 'effect', name: 'Effects' },
@@ -360,7 +423,7 @@ export default function App() {
                     tab.isPlaying ? "bg-emerald-500 text-white shadow-[0_0_10px_rgba(16,185,129,0.3)]" : "bg-white/10 text-white hover:bg-white/20"
                   )}
                 >
-                  {tab.isPlaying ? <Square className="w-2.5 h-2.5" fill="currentColor"/> : <Play className="w-2.5 h-2.5" fill="currentColor" className="ml-0.5"/>}
+                  {tab.isPlaying ? <Square className="w-2.5 h-2.5" fill="currentColor"/> : <Play className="w-2.5 h-2.5 ml-0.5" fill="currentColor"/>}
                 </button>
                 <span>{tab.name}</span>
                 <span className="flex gap-0.5 w-3 mt-0.5 opacity-80">
@@ -381,6 +444,13 @@ export default function App() {
           >
              <Plus size={12} strokeWidth={3} />
              New
+          </button>
+
+          <button 
+             onClick={() => setIsKeyboardVisible(!isKeyboardVisible)}
+             className="px-4 py-3 rounded-t-lg bg-black/20 hover:bg-black/40 text-zinc-500 hover:text-zinc-300 transition-colors uppercase tracking-widest text-[10px] font-bold border border-transparent flex items-center gap-1.5 ml-2"
+          >
+             Keyboard
           </button>
         </div>
 
@@ -617,7 +687,7 @@ export default function App() {
                 )}
               >
                 {isRecording ? <MicOff size={10} /> : <Mic size={10} />}
-                {isRecording ? 'Stop' : 'Rec New'}
+                {isRecording ? 'Stop Voice' : 'Voice Rec'}
               </button>
             </div>
           </div>
@@ -675,6 +745,63 @@ export default function App() {
         </section>
         
       </main>
+
+      {/* Floating Keyboard */}
+      <AnimatePresence>
+        {isKeyboardVisible && (
+          <motion.div
+            initial={{ x: '100%' }}
+            animate={{ x: 0 }}
+            exit={{ x: '100%' }}
+            transition={{ type: 'spring', stiffness: 300, damping: 30 }}
+            className="fixed top-0 right-0 h-full w-80 bg-zinc-900/95 backdrop-blur-xl border-l border-white/10 flex flex-col z-50"
+          >
+            <div className="flex items-center justify-between p-4 border-b border-white/10">
+              <h2 className="text-sm font-bold uppercase tracking-widest text-zinc-300">4x4 Keyboard</h2>
+              <div className="flex gap-2">
+                <button 
+                  onClick={isRecordingKeyboard ? stopKeyboardRecording : startKeyboardRecording}
+                  className={cn(
+                    "px-3 py-1 rounded text-xs font-bold uppercase tracking-widest transition-all",
+                    isRecordingKeyboard ? "bg-red-500 text-white animate-pulse" : "bg-white/10 text-zinc-400 hover:bg-white/20"
+                  )}
+                >
+                  {isRecordingKeyboard ? 'Stop Seq' : 'Seq Rec'}
+                </button>
+                <button 
+                  onClick={() => setIsKeyboardVisible(false)}
+                  className="p-1 rounded bg-white/10 hover:bg-white/20 text-zinc-400 hover:text-white transition-colors"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 p-4 flex items-center justify-center">
+              <div className="grid grid-cols-4 gap-2 w-full max-w-xs">
+                {KEYBOARD_NOTES.map((row, rowIndex) => 
+                  row.map((note, colIndex) => (
+                    <button
+                      key={`${rowIndex}-${colIndex}`}
+                      onMouseDown={() => handleKeyboardKeyPress(note)}
+                      className="aspect-square bg-zinc-800 hover:bg-zinc-700 active:bg-zinc-600 border border-white/20 rounded-lg flex items-center justify-center text-xs font-mono text-zinc-400 hover:text-white transition-all"
+                    >
+                      {['C','C#','D','D#','E','F','F#','G','G#','A','A#','B','C','C#','D','D#'][rowIndex * 4 + colIndex]}
+                      <sub className="text-[8px]">{4 + Math.floor((rowIndex * 4 + colIndex) / 12)}</sub>
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div className="p-4 border-t border-white/10">
+              <div className="text-xs text-zinc-500">
+                {isRecordingKeyboard ? `Recording... Notes: ${recordedNotes.length}` : 'Click Record to start capturing your performance'}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
