@@ -1,4 +1,4 @@
-export type Category = 'beat' | 'effect' | 'bass' | 'melody' | 'experimental' | 'custom';
+export type Category = 'beat' | 'effect' | 'bass' | 'melody' | 'experimental' | 'custom' | 'theme';
 
 export interface FxParams {
   lpf: number; hpf: number; volume: number; sidechain: number;
@@ -78,6 +78,14 @@ export const AVAILABLE_SOUNDS: SoundDef[] = [
   { id: 'x2', name: 'Laser', category: 'experimental', color: 'bg-fuchsia-500', pattern: parsePattern('Y.......Y.......') },
   { id: 'x3', name: 'Animal', category: 'experimental', color: 'bg-fuchsia-500', pattern: parsePattern('Z...........Z...') },
   { id: 'x4', name: 'Train', category: 'experimental', color: 'bg-fuchsia-500', pattern: parsePattern('W.W.W.W.W.W.W.W.') },
+
+  // Theme (旋律组)
+  { id: 't1', name: '前奏', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('a..c..e..g..a...') },
+  { id: 't2', name: '主歌', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('a.c.e.g.a.c.e.a.') },
+  { id: 't3', name: '副歌', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('c.e.g.c.e.g.c.e.') },
+  { id: 't4', name: '间奏', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('g.e.c..a..c..e..') },
+  { id: 't5', name: '尾奏', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('a.......a...a..a') },
+  { id: 't6', name: '和声铺垫', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('h..h..h..h..h..h') },
 ];
 
 function createReverbBuffer(ctx: AudioContext) {

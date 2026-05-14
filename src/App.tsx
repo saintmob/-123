@@ -320,6 +320,7 @@ export default function App() {
     { id: 'melody', name: 'Melodies' },
     { id: 'bass', name: 'Basses' },
     { id: 'experimental', name: 'Experimental' },
+    { id: 'theme', name: '旋律组' },
     { id: 'custom', name: 'Custom / Recorded' },
   ];
 
