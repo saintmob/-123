@@ -23,6 +23,35 @@ export interface SoundDef {
   playMode?: 'pattern' | 'buffer'; // New: 'pattern' for sequenced notes, 'buffer' for direct audio playback
 }
 
+export type AudioStyleId =
+  | 'default'
+  | 'orchestral'
+  | 'club'
+  | 'trap'
+  | 'chiptune'
+  | 'ambient'
+  | 'industrial'
+  | 'experimental';
+
+export interface AudioStyle {
+  id: AudioStyleId;
+  name: string;
+  accent: string;
+}
+
+export const AUDIO_STYLES: AudioStyle[] = [
+  { id: 'default', name: 'Clean', accent: 'bg-slate-400' },
+  { id: 'orchestral', name: 'Orchestral', accent: 'bg-yellow-500' },
+  { id: 'club', name: 'Club', accent: 'bg-emerald-500' },
+  { id: 'trap', name: 'Trap 808', accent: 'bg-violet-500' },
+  { id: 'chiptune', name: 'Chiptune', accent: 'bg-cyan-500' },
+  { id: 'ambient', name: 'Ambient', accent: 'bg-sky-500' },
+  { id: 'industrial', name: 'Industrial', accent: 'bg-red-500' },
+  { id: 'experimental', name: 'Experimental', accent: 'bg-fuchsia-500' },
+];
+
+const DEFAULT_STYLE = AUDIO_STYLES[0];
+
 const parsePattern = (str: string) => {
   return str.split('').map(char => {
     if (char === '.') return {};
@@ -237,6 +266,7 @@ export class ProjectEngine {
   id: string;
   isPlaying = false;
   step = 0;
+  style: AudioStyle = DEFAULT_STYLE;
   slots: (SoundDef | null)[] = new Array(7).fill(null);
   mutedSlots: boolean[] = new Array(7).fill(false);
   channels: SlotChannel[] = [];
@@ -271,6 +301,10 @@ export class ProjectEngine {
 
   setMutedSlots(muted: boolean[]) {
     this.mutedSlots = muted;
+  }
+
+  setStyle(styleId: AudioStyleId) {
+    this.style = AUDIO_STYLES.find(style => style.id === styleId) || DEFAULT_STYLE;
   }
 
   play() {
@@ -392,8 +426,301 @@ export class ProjectEngine {
     source.start(time, 0, duration);
   }
 
+  private makeNoise(duration: number) {
+    const bufferSize = Math.max(1, Math.floor(this.ctx.sampleRate * duration));
+    const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = Math.random() * 2 - 1;
+    }
+    return buffer;
+  }
+
+  private connectFiltered(source: AudioNode, time: number, channelIndex: number, gainValue: number, duration: number, filterType: BiquadFilterType, frequency: number, q = 1) {
+    const gain = this.ctx.createGain();
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = filterType;
+    filter.frequency.setValueAtTime(frequency, time);
+    filter.Q.setValueAtTime(q, time);
+    source.connect(filter);
+    filter.connect(gain);
+    gain.connect(this.channels[channelIndex].input);
+    gain.gain.setValueAtTime(gainValue, time);
+    gain.gain.exponentialRampToValueAtTime(0.001, time + duration);
+    return { gain, filter };
+  }
+
+  private playStyledExperimental(type: string, time: number, channelIndex: number) {
+    const ctx = this.ctx;
+    const styleId = this.style.id;
+    const shift = this.channels[channelIndex].pitchShift;
+    const rateMultiplier = Math.pow(2, shift / 12);
+
+    if (styleId === 'orchestral' || styleId === 'ambient') {
+      const noise = ctx.createBufferSource();
+      noise.buffer = this.makeNoise(styleId === 'ambient' ? 0.8 : 0.28);
+      const { filter } = this.connectFiltered(noise, time, channelIndex, styleId === 'ambient' ? 0.09 : 0.18, styleId === 'ambient' ? 0.8 : 0.28, 'bandpass', type === 'laser' ? 1800 : 620, 4);
+      filter.frequency.exponentialRampToValueAtTime(styleId === 'ambient' ? 260 : 1100, time + (styleId === 'ambient' ? 0.75 : 0.18));
+      noise.start(time);
+      return;
+    }
+
+    if (styleId === 'chiptune') {
+      const osc = ctx.createOscillator();
+      osc.type = 'square';
+      osc.frequency.setValueAtTime((type === 'laser' ? 1320 : 330) * rateMultiplier, time);
+      osc.frequency.setValueAtTime((type === 'glitch' ? 1760 : 220) * rateMultiplier, time + 0.045);
+      this.connectFiltered(osc, time, channelIndex, 0.22, 0.12, 'lowpass', 4200, 1);
+      osc.start(time);
+      osc.stop(time + 0.12);
+      return;
+    }
+
+    if (styleId === 'industrial' || styleId === 'experimental') {
+      const carrier = ctx.createOscillator();
+      const mod = ctx.createOscillator();
+      const modGain = ctx.createGain();
+      carrier.type = styleId === 'industrial' ? 'sawtooth' : 'square';
+      carrier.frequency.setValueAtTime((type === 'train' ? 90 : 240 + Math.random() * 640) * rateMultiplier, time);
+      mod.type = 'square';
+      mod.frequency.setValueAtTime(styleId === 'industrial' ? 47 : 31, time);
+      modGain.gain.setValueAtTime(styleId === 'industrial' ? 520 : 280, time);
+      mod.connect(modGain);
+      modGain.connect(carrier.frequency);
+      this.connectFiltered(carrier, time, channelIndex, styleId === 'industrial' ? 0.32 : 0.26, styleId === 'industrial' ? 0.22 : 0.14, 'bandpass', styleId === 'industrial' ? 760 : 2400, 9);
+      carrier.start(time);
+      mod.start(time);
+      carrier.stop(time + 0.22);
+      mod.stop(time + 0.22);
+      return;
+    }
+
+    const osc = ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime((type === 'laser' ? 1200 : 300) * rateMultiplier, time);
+    osc.frequency.exponentialRampToValueAtTime(80 * rateMultiplier, time + 0.16);
+    this.connectFiltered(osc, time, channelIndex, 0.26, 0.18, 'highpass', styleId === 'trap' ? 1600 : 900, 1);
+    osc.start(time);
+    osc.stop(time + 0.18);
+  }
+
+  private playStyledDrum(type: string, time: number, channelIndex: number) {
+    const ctx = this.ctx;
+    const styleId = this.style.id;
+
+    if (styleId === 'orchestral') {
+      if (type === 'kick') {
+        const drum = ctx.createOscillator();
+        drum.type = 'sine';
+        drum.frequency.setValueAtTime(78, time);
+        drum.frequency.exponentialRampToValueAtTime(48, time + 0.42);
+        this.connectFiltered(drum, time, channelIndex, 0.75, 0.65, 'lowpass', 420, 1.3);
+        drum.start(time);
+        drum.stop(time + 0.65);
+      } else {
+        const noise = ctx.createBufferSource();
+        noise.buffer = this.makeNoise(type === 'hihat' ? 0.35 : 0.22);
+        const freq = type === 'hihat' ? 7200 : type === 'snare' ? 1900 : 2600;
+        this.connectFiltered(noise, time, channelIndex, type === 'hihat' ? 0.13 : 0.28, type === 'hihat' ? 0.35 : 0.22, 'bandpass', freq, type === 'hihat' ? 7 : 3);
+        noise.start(time);
+      }
+      return;
+    }
+
+    if (styleId === 'trap') {
+      if (type === 'kick') {
+        const sub = ctx.createOscillator();
+        sub.type = 'sine';
+        sub.frequency.setValueAtTime(92, time);
+        sub.frequency.exponentialRampToValueAtTime(38, time + 0.72);
+        const { gain } = this.connectFiltered(sub, time, channelIndex, 0.95, 0.85, 'lowpass', 260, 0.7);
+        gain.gain.setValueAtTime(0.74, time + 0.22);
+        sub.start(time);
+        sub.stop(time + 0.85);
+      } else {
+        const noise = ctx.createBufferSource();
+        noise.buffer = this.makeNoise(type === 'hihat' ? 0.035 : 0.14);
+        this.connectFiltered(noise, time, channelIndex, type === 'hihat' ? 0.22 : 0.42, type === 'hihat' ? 0.035 : 0.14, 'highpass', type === 'hihat' ? 9800 : 2200, 2.2);
+        noise.start(time);
+      }
+      return;
+    }
+
+    if (styleId === 'chiptune') {
+      const osc = ctx.createOscillator();
+      osc.type = type === 'kick' ? 'triangle' : 'square';
+      osc.frequency.setValueAtTime(type === 'kick' ? 120 : type === 'snare' ? 260 : 2200, time);
+      osc.frequency.exponentialRampToValueAtTime(type === 'kick' ? 55 : 90, time + 0.08);
+      this.connectFiltered(osc, time, channelIndex, type === 'kick' ? 0.55 : 0.2, type === 'kick' ? 0.18 : 0.07, 'lowpass', type === 'hihat' ? 5000 : 1600, 1);
+      osc.start(time);
+      osc.stop(time + (type === 'kick' ? 0.18 : 0.07));
+      return;
+    }
+
+    if (styleId === 'ambient') {
+      const noise = ctx.createBufferSource();
+      noise.buffer = this.makeNoise(type === 'kick' ? 0.55 : 0.75);
+      this.connectFiltered(noise, time, channelIndex, type === 'kick' ? 0.22 : 0.1, type === 'kick' ? 0.55 : 0.75, 'lowpass', type === 'kick' ? 180 : 1600, 0.8);
+      noise.start(time);
+      return;
+    }
+
+    if (styleId === 'industrial' || styleId === 'experimental') {
+      const hit = ctx.createOscillator();
+      const mod = ctx.createOscillator();
+      const modGain = ctx.createGain();
+      hit.type = styleId === 'industrial' ? 'sawtooth' : 'square';
+      hit.frequency.setValueAtTime(type === 'kick' ? 95 : type === 'hihat' ? 1200 : 320, time);
+      mod.type = 'square';
+      mod.frequency.setValueAtTime(type === 'hihat' ? 90 : 42, time);
+      modGain.gain.setValueAtTime(styleId === 'industrial' ? 360 : 180, time);
+      mod.connect(modGain);
+      modGain.connect(hit.frequency);
+      this.connectFiltered(hit, time, channelIndex, type === 'kick' ? 0.62 : 0.28, type === 'kick' ? 0.32 : 0.12, 'bandpass', type === 'kick' ? 280 : 1500, 8);
+      hit.start(time);
+      mod.start(time);
+      hit.stop(time + 0.32);
+      mod.stop(time + 0.32);
+      return;
+    }
+
+    if (type === 'kick') {
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(155, time);
+      osc.frequency.exponentialRampToValueAtTime(42, time + 0.35);
+      this.connectFiltered(osc, time, channelIndex, 0.95, 0.42, 'lowpass', 520, 1);
+      osc.start(time);
+      osc.stop(time + 0.42);
+    } else {
+      const noise = ctx.createBufferSource();
+      noise.buffer = this.makeNoise(type === 'hihat' ? 0.045 : 0.18);
+      this.connectFiltered(noise, time, channelIndex, type === 'hihat' ? 0.24 : 0.48, type === 'hihat' ? 0.045 : 0.18, 'highpass', type === 'hihat' ? 7600 : 1600, 1.5);
+      noise.start(time);
+    }
+  }
+
+  private playStyledSynth(midiNote: number, category: string, time: number, channelIndex: number) {
+    const ctx = this.ctx;
+    const styleId = this.style.id;
+    const shift = this.channels[channelIndex].pitchShift;
+    const baseFreq = 440 * Math.pow(2, (midiNote + shift - 69) / 12);
+    const isBass = category === 'bass';
+    const freq = isBass ? baseFreq / 2 : baseFreq;
+
+    if (styleId === 'orchestral') {
+      const voices = isBass ? [0, 7] : [-7, 0, 4, 12];
+      const gain = ctx.createGain();
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(isBass ? 620 : 1800, time);
+      filter.Q.setValueAtTime(0.8, time);
+      filter.connect(gain);
+      gain.connect(this.channels[channelIndex].input);
+      gain.gain.setValueAtTime(0.001, time);
+      gain.gain.linearRampToValueAtTime(isBass ? 0.28 : 0.18, time + 0.08);
+      gain.gain.exponentialRampToValueAtTime(0.001, time + (isBass ? 0.85 : 1.15));
+      voices.forEach((semi, index) => {
+        const voice = ctx.createOscillator();
+        voice.type = index % 2 ? 'sine' : 'triangle';
+        voice.frequency.setValueAtTime(freq * Math.pow(2, semi / 12), time);
+        voice.detune.setValueAtTime((index - 1.5) * 5, time);
+        voice.connect(filter);
+        voice.start(time);
+        voice.stop(time + (isBass ? 0.85 : 1.15));
+      });
+      return;
+    }
+
+    if (styleId === 'trap' && isBass) {
+      const sub = ctx.createOscillator();
+      sub.type = 'sine';
+      sub.frequency.setValueAtTime(freq, time);
+      sub.frequency.exponentialRampToValueAtTime(Math.max(28, freq * 0.72), time + 0.2);
+      const { gain } = this.connectFiltered(sub, time, channelIndex, 0.8, 0.8, 'lowpass', 240, 0.8);
+      gain.gain.setValueAtTime(0.66, time + 0.25);
+      sub.start(time);
+      sub.stop(time + 0.8);
+      return;
+    }
+
+    if (styleId === 'chiptune') {
+      const osc = ctx.createOscillator();
+      osc.type = isBass ? 'square' : 'square';
+      osc.frequency.setValueAtTime(freq, time);
+      this.connectFiltered(osc, time, channelIndex, isBass ? 0.36 : 0.2, isBass ? 0.18 : 0.12, 'lowpass', isBass ? 900 : 5200, 1);
+      osc.start(time);
+      osc.stop(time + (isBass ? 0.18 : 0.12));
+      return;
+    }
+
+    if (styleId === 'ambient') {
+      const gain = ctx.createGain();
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(isBass ? 420 : 900, time);
+      filter.connect(gain);
+      gain.connect(this.channels[channelIndex].input);
+      gain.gain.setValueAtTime(0.001, time);
+      gain.gain.linearRampToValueAtTime(isBass ? 0.18 : 0.11, time + 0.24);
+      gain.gain.exponentialRampToValueAtTime(0.001, time + 1.8);
+      [0, 7, 12].forEach((semi, index) => {
+        const pad = ctx.createOscillator();
+        pad.type = 'sine';
+        pad.frequency.setValueAtTime(freq * Math.pow(2, semi / 12), time);
+        pad.detune.setValueAtTime([-9, 6, 14][index], time);
+        pad.connect(filter);
+        pad.start(time);
+        pad.stop(time + 1.8);
+      });
+      return;
+    }
+
+    if (styleId === 'industrial' || styleId === 'experimental') {
+      const carrier = ctx.createOscillator();
+      const mod = ctx.createOscillator();
+      const modGain = ctx.createGain();
+      carrier.type = styleId === 'industrial' ? 'sawtooth' : 'square';
+      carrier.frequency.setValueAtTime(freq, time);
+      mod.type = 'sine';
+      mod.frequency.setValueAtTime(freq * (isBass ? 1.5 : 2.7), time);
+      modGain.gain.setValueAtTime(styleId === 'industrial' ? 220 : 320, time);
+      mod.connect(modGain);
+      modGain.connect(carrier.frequency);
+      this.connectFiltered(carrier, time, channelIndex, isBass ? 0.4 : 0.22, styleId === 'industrial' ? 0.24 : 0.13, 'bandpass', isBass ? 560 : 2400, 7);
+      carrier.start(time);
+      mod.start(time);
+      carrier.stop(time + (styleId === 'industrial' ? 0.24 : 0.13));
+      mod.stop(time + (styleId === 'industrial' ? 0.24 : 0.13));
+      return;
+    }
+
+    if (styleId === 'club') {
+      const detuned = ctx.createOscillator();
+      const main = ctx.createOscillator();
+      const mix = ctx.createGain();
+      main.type = isBass ? 'square' : 'sawtooth';
+      detuned.type = 'sawtooth';
+      main.frequency.setValueAtTime(freq, time);
+      detuned.frequency.setValueAtTime(freq, time);
+      main.detune.setValueAtTime(-9, time);
+      detuned.detune.setValueAtTime(9, time);
+      main.connect(mix);
+      detuned.connect(mix);
+      this.connectFiltered(mix, time, channelIndex, isBass ? 0.42 : 0.2, isBass ? 0.28 : 0.32, 'lowpass', isBass ? 900 : 3600, 1.2);
+      main.start(time);
+      detuned.start(time);
+      main.stop(time + (isBass ? 0.28 : 0.32));
+      detuned.stop(time + (isBass ? 0.28 : 0.32));
+    }
+  }
+
   private playExperimental(type: string, time: number, channelIndex: number) {
     const ctx = this.ctx;
+    if (this.style.id !== 'default') {
+      this.playStyledExperimental(type, time, channelIndex);
+      return;
+    }
     const gain = ctx.createGain();
     gain.connect(this.channels[channelIndex].input);
     const shift = this.channels[channelIndex].pitchShift;
@@ -463,6 +790,10 @@ export class ProjectEngine {
 
   private playDrum(type: string, time: number, channelIndex: number) {
     const ctx = this.ctx;
+    if (this.style.id !== 'default') {
+      this.playStyledDrum(type, time, channelIndex);
+      return;
+    }
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.connect(gain);
@@ -531,6 +862,10 @@ export class ProjectEngine {
 
   private playSynth(midiNote: number, category: string, time: number, channelIndex: number) {
     const ctx = this.ctx;
+    if (this.style.id !== 'default') {
+      this.playStyledSynth(midiNote, category, time, channelIndex);
+      return;
+    }
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     const filter = ctx.createBiquadFilter();
