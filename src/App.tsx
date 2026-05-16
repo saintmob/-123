@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus } from 'lucide-react';
+import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus, Wand2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { AVAILABLE_SOUNDS, SoundDef, engineManager, FxParams, defaultFx, KEYBOARD_NOTES } from './audio';
+import { AUDIO_STYLES, AVAILABLE_SOUNDS, AudioStyleId, SoundDef, engineManager, FxParams, defaultFx, KEYBOARD_NOTES } from './audio';
 import { cn } from './lib/utils';
 
 const KEYBOARD_INSTRUMENT_MODES = [
@@ -22,6 +22,7 @@ interface TabData {
   mutedSlots: boolean[];
   fxSlots: FxParams[];
   masterFx: FxParams;
+  styleId: AudioStyleId;
   isPlaying: boolean;
   activeStep: number;
 }
@@ -34,6 +35,7 @@ export default function App() {
     mutedSlots: new Array(7).fill(false),
     fxSlots: new Array(7).fill(null).map(defaultFx),
     masterFx: defaultFx(),
+    styleId: 'default',
     isPlaying: false,
     activeStep: 0
   }]);
@@ -98,6 +100,7 @@ export default function App() {
       mutedSlots: new Array(7).fill(false),
       fxSlots: new Array(7).fill(null).map(defaultFx),
       masterFx: defaultFx(),
+      styleId: 'default',
       isPlaying: false,
       activeStep: 0
     };
@@ -110,6 +113,7 @@ export default function App() {
     const engine = engineManager.getProject(id);
     const tab = tabs.find(t => t.id === id);
     if (!tab) return;
+    engine.setStyle(tab.styleId);
     
     if (!tab.isPlaying) {
       engine.play();
@@ -190,6 +194,11 @@ export default function App() {
     }));
   };
 
+  const handleStyleChange = (styleId: AudioStyleId) => {
+    setTabs(prev => prev.map(t => t.id === activeTab.id ? { ...t, styleId } : t));
+    engineManager.getProject(activeTab.id).setStyle(styleId);
+  };
+
   const toggleMute = (index: number) => {
     if (!activeTab.slots[index]) return;
     const newMuted = [...activeTab.mutedSlots];
@@ -220,6 +229,7 @@ export default function App() {
       
       setTabs(prev => prev.map(t => t.id === activeTab.id ? { ...t, slots: newSlots } : t));
       const engine = engineManager.getProject(activeTab.id);
+      engine.setStyle(activeTab.styleId);
       engine.setSlots(newSlots);
       
       if (!activeTab.isPlaying) {
@@ -575,7 +585,37 @@ export default function App() {
       </header>
 
       {/* Main Content Area */}
-      <main className="flex-1 w-full flex flex-col p-6 gap-6 overflow-hidden">
+      <main className="flex-1 w-full flex flex-col p-6 gap-5 overflow-hidden">
+        <section className="shrink-0 flex flex-col gap-3">
+          <div className="flex items-center gap-2">
+            <Wand2 className="w-4 h-4 text-zinc-500" />
+            <h2 className="text-[9px] font-bold uppercase tracking-[0.2em] text-zinc-600">One-Tap Style</h2>
+            <div className="h-px flex-1 bg-zinc-800"></div>
+          </div>
+          <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-none">
+            {AUDIO_STYLES.map((style) => {
+              const selected = activeTab.styleId === style.id;
+
+              return (
+                <button
+                  key={style.id}
+                  type="button"
+                  onClick={() => handleStyleChange(style.id)}
+                  className={cn(
+                    "h-9 shrink-0 rounded border px-3 text-[10px] font-bold uppercase tracking-widest transition-all flex items-center gap-2",
+                    selected
+                      ? "border-white/30 bg-white/15 text-white shadow-[0_0_18px_rgba(255,255,255,0.08)]"
+                      : "border-white/5 bg-white/5 text-zinc-500 hover:bg-white/10 hover:text-zinc-300"
+                  )}
+                  title={`Switch ${activeTab.name} to ${style.name} without changing its rhythm`}
+                >
+                  <span className={cn("h-2 w-2 rounded-full", style.accent)}></span>
+                  {style.name}
+                </button>
+              )
+            })}
+          </div>
+        </section>
         
         {/* TOP: Performance Modules (Drop Zones) */}
         <section className="flex-1 bg-zinc-900/50 rounded-2xl border border-white/5 p-8 flex flex-col overflow-hidden relative">
