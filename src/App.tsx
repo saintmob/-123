@@ -232,11 +232,12 @@ export default function App() {
     name: string;
     slots: (SerializableSoundDef | null)[];
     mutedSlots: boolean[];
-    fxSlots: FxParams[];
+    moduleFx: FxParams[];
     masterFx: FxParams;
     styleId: AudioStyleId;
     activeStep: number;
     isPlaying: boolean;
+    fxSlots?: FxParams[]; // backward compatibility for older exports
   }
 
   interface MusicArrFile {
@@ -361,7 +362,7 @@ export default function App() {
       name: tab.name,
       slots: await Promise.all(tab.slots.map((slot) => slot ? serializeSoundDef(slot) : null)),
       mutedSlots: tab.mutedSlots,
-      fxSlots: tab.fxSlots,
+      moduleFx: tab.fxSlots,
       masterFx: tab.masterFx,
       styleId: tab.styleId,
       activeStep: tab.activeStep,
@@ -420,6 +421,7 @@ export default function App() {
       const importedTabs = await Promise.all(data.tabs.map(async (tab) => ({
         ...tab,
         slots: await Promise.all(tab.slots.map((slot) => slot ? deserializeSoundDef(slot) : null)),
+        fxSlots: tab.moduleFx ?? tab.fxSlots ?? new Array(7).fill(null).map(defaultFx),
       })));
 
       setRecordedSounds(importedRecordedSounds);
@@ -433,7 +435,7 @@ export default function App() {
         engine.setStyle(tab.styleId);
         engine.setSlots(tab.slots);
         engine.setMutedSlots(tab.mutedSlots);
-        tab.fxSlots.forEach((fx, index) => engine.setFxParams(index, fx));
+        (tab.fxSlots || tab.moduleFx || []).forEach((fx, index) => engine.setFxParams(index, fx));
         engine.setMasterFxParams(tab.masterFx);
       });
     } catch (err) {
