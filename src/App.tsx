@@ -1542,13 +1542,6 @@ export default function App() {
             {isDayMode ? <Moon size={11} /> : <Sun size={11} />}
             {isDayMode ? 'Night' : 'Day'}
           </button>
-          <div className={cn("flex gap-4 px-3 py-1.5 rounded flex-shrink-0 opacity-80", isDayMode ? "bg-slate-900/5 text-slate-800" : "bg-white/5 text-white")}>
-             <span>BPM: 120</span>
-             <span className={isDayMode ? "text-slate-300" : "text-white/20"}>|</span>
-             <span>KEY: C MAJ</span>
-             <span className={isDayMode ? "text-slate-300" : "text-white/20"}>|</span>
-             <span className="w-20 text-right">STEP: {activeTab.activeStep + 1}/16</span>
-          </div>
         </div>
       </header>
 
