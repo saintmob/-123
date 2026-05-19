@@ -131,6 +131,11 @@ export const AVAILABLE_SOUNDS: SoundDef[] = [
   { id: 's13', name: 'Moog Soul', category: 'bass', color: 'bg-blue-500', pattern: parsePattern('a..c.a..e.c.a...') },
   { id: 's14', name: 'Boom Bap Sub', category: 'bass', color: 'bg-blue-500', pattern: parsePattern('a.......a.c...e.') },
   { id: 's15', name: 'Afro Bass', category: 'bass', color: 'bg-blue-500', pattern: parsePattern('a..c..a.e..c.a..') },
+  { id: 's16', name: 'Legato Sub', category: 'bass', color: 'bg-blue-500', pattern: parsePattern('aaccddeeffeedcaa') },
+  { id: 's17', name: 'Glide Bass', category: 'bass', color: 'bg-blue-500', pattern: parsePattern('aa..ccddeeffcc..') },
+  { id: 's18', name: 'Liquid Bass', category: 'bass', color: 'bg-blue-500', pattern: parsePattern('aabbccddeeddccaa') },
+  { id: 's19', name: 'R&B Legato', category: 'bass', color: 'bg-blue-500', pattern: parsePattern('a...ccddeeffeedd') },
+  { id: 's20', name: 'Cine Legato', category: 'bass', color: 'bg-blue-500', pattern: parsePattern('aaacccggffeeddaa') },
 
   // Melody
   { id: 'm1', name: 'Chords', category: 'melody', color: 'bg-green-500', pattern: parsePattern('.h..j...l.......') },
@@ -189,6 +194,11 @@ export const AVAILABLE_SOUNDS: SoundDef[] = [
   { id: 't14', name: 'Dub Bass Hook', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('a.c.e...a.c.e...') },
   { id: 't15', name: 'Soul Chorus', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('h.j.l.h.o.l.j...') },
   { id: 't16', name: 'Club Lead', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('l.o.l.j.l.o.l.j.') },
+  { id: 't17', name: '连奏主线 A', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('hhijjklmmlkjjihh') },
+  { id: 't18', name: '连奏主线 B', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('hjjllnoonlljjh..') },
+  { id: 't19', name: 'Neo Legato', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('hhiijjllmmlljjii') },
+  { id: 't20', name: 'Dream Legato', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('h...jjlloooonllj') },
+  { id: 't21', name: 'Club Legato', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('llnnoommljjllnno') },
 ];
 
 // 4x4 Keyboard notes mapping (MIDI notes)
@@ -341,16 +351,13 @@ export class ProjectEngine {
   ctx: AudioContext;
   id: string;
   isPlaying = false;
+  pendingStart = false;
   step = 0;
   style: AudioStyle = DEFAULT_STYLE;
   slots: (SoundDef | null)[] = new Array(7).fill(null);
   mutedSlots: boolean[] = new Array(7).fill(false);
   channels: SlotChannel[] = [];
   masterChannel: SlotChannel;
-  lookahead = 25.0; // ms
-  scheduleAheadTime = 0.1; // s
-  nextNoteTime = 0.0;
-  lookaheadInterval: any = null;
 
   constructor(id: string, ctx: AudioContext, masterOut: AudioNode) {
     this.id = id;
@@ -388,36 +395,40 @@ export class ProjectEngine {
     this.style = AUDIO_STYLES.find(style => style.id === styleId) || DEFAULT_STYLE;
   }
 
-  play() {
+  queueStart() {
     if (this.ctx.state === 'suspended') {
       this.ctx.resume();
     }
     if (this.isPlaying) return;
+    this.pendingStart = true;
+  }
+
+  startSynced(step = 0) {
+    if (this.ctx.state === 'suspended') {
+      this.ctx.resume();
+    }
     this.isPlaying = true;
-    this.step = 0;
-    this.nextNoteTime = this.ctx.currentTime + 0.05;
-    this.scheduler();
+    this.pendingStart = false;
+    this.step = step;
+  }
+
+  play() {
+    this.startSynced(0);
   }
 
   stop() {
     this.isPlaying = false;
-    if (this.lookaheadInterval !== null) {
-      clearInterval(this.lookaheadInterval);
-      this.lookaheadInterval = null;
-    }
+    this.pendingStart = false;
   }
 
-  private nextNote() {
-    const secondsPerBeat = 60.0 / 120;
-    // 16th notes
-    this.nextNoteTime += 0.25 * secondsPerBeat;
-    this.step++;
-    if (this.step === 16) {
-      this.step = 0;
-    }
+  scheduleStep(stepNumber: number, time: number) {
+    if (!this.isPlaying) return;
+    this.step = stepNumber;
+    this.scheduleNote(stepNumber, time);
   }
 
   private scheduleNote(stepNumber: number, time: number) {
+    this.step = stepNumber;
     this.slots.forEach((slot, index) => {
       if (!slot || this.mutedSlots[index]) return;
 
@@ -492,16 +503,6 @@ export class ProjectEngine {
     assetBufferPromises.get(slot.assetUrl)?.then(buffer => {
       slot.buffer = buffer;
     }).catch(() => undefined);
-  }
-
-  private scheduler() {
-    this.lookaheadInterval = setInterval(() => {
-      if (!this.isPlaying) return;
-      while (this.nextNoteTime < this.ctx.currentTime + this.scheduleAheadTime) {
-        this.scheduleNote(this.step, this.nextNoteTime);
-        this.nextNote()
-      }
-    }, this.lookahead);
   }
 
   private playBuffer(buffer: AudioBuffer, time: number, mode: 'fast' | 'full', channelIndex: number) {
@@ -1161,6 +1162,12 @@ export class ProjectEngine {
 export class GlobalEngineManager {
   ctx: AudioContext | null = null;
   projects: Map<string, ProjectEngine> = new Map();
+  bpm = 120;
+  step = 0;
+  nextNoteTime = 0;
+  lookahead = 25;
+  scheduleAheadTime = 0.1;
+  clockInterval: ReturnType<typeof setInterval> | null = null;
 
   init() {
     if (!this.ctx) {
@@ -1180,6 +1187,78 @@ export class GlobalEngineManager {
       this.projects.set(id, p);
     }
     return this.projects.get(id)!;
+  }
+
+  get isClockRunning() {
+    return this.clockInterval !== null;
+  }
+
+  startProject(id: string): 'started' | 'queued' {
+    const project = this.getProject(id);
+    if (!this.isClockRunning) {
+      project.startSynced(0);
+      this.step = 0;
+      this.nextNoteTime = this.ctx!.currentTime + 0.05;
+      this.startClock();
+      this.dispatchProjectStart(project);
+      return 'started';
+    }
+
+    project.queueStart();
+    return 'queued';
+  }
+
+  stopProject(id: string) {
+    const project = this.getProject(id);
+    project.stop();
+  }
+
+  stopAllProjects() {
+    this.projects.forEach(project => project.stop());
+    if (this.clockInterval !== null) {
+      clearInterval(this.clockInterval);
+      this.clockInterval = null;
+    }
+    this.step = 0;
+    this.nextNoteTime = 0;
+  }
+
+  private startClock() {
+    if (this.clockInterval !== null) return;
+    this.clockInterval = setInterval(() => this.scheduler(), this.lookahead);
+  }
+
+  private nextStep() {
+    const secondsPerBeat = 60 / this.bpm;
+    this.nextNoteTime += 0.25 * secondsPerBeat;
+    this.step = (this.step + 1) % 16;
+  }
+
+  private activatePendingAtMeasureStart() {
+    if (this.step !== 0) return;
+    this.projects.forEach(project => {
+      if (!project.pendingStart) return;
+      project.startSynced(0);
+      this.dispatchProjectStart(project);
+    });
+  }
+
+  private scheduler() {
+    if (!this.ctx) return;
+    while (this.nextNoteTime < this.ctx.currentTime + this.scheduleAheadTime) {
+      this.activatePendingAtMeasureStart();
+      this.projects.forEach(project => {
+        project.scheduleStep(this.step, this.nextNoteTime);
+      });
+      this.nextStep();
+    }
+  }
+
+  private dispatchProjectStart(project: ProjectEngine) {
+    const event = new CustomEvent('project-start', {
+      detail: { projectId: project.id, step: project.step },
+    });
+    window.dispatchEvent(event);
   }
 
   async processBuffer(buffer: AudioBuffer): Promise<AudioBuffer> {

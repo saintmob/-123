@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus, Save, RotateCcw, Shuffle, Keyboard, Circle, Wand2, Sun, Moon, Trash2 } from 'lucide-react';
+import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus, RotateCcw, Shuffle, Keyboard, Circle, Wand2, Sun, Moon, Trash2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { AUDIO_STYLES, AVAILABLE_SOUNDS, AudioStyleId, SoundDef, engineManager, FxParams, defaultFx, KEYBOARD_NOTES } from './audio';
 import { cn } from './lib/utils';
@@ -383,6 +383,7 @@ export default function App() {
   const [selectedStyleId, setSelectedStyleId] = useState(initialWorkbench?.styleId ?? STYLE_PRESETS[0].id);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved' | 'loaded'>('idle');
   const [colorMode, setColorMode] = useState<ColorMode>(hydrateColorMode);
+  const [pendingPlayIds, setPendingPlayIds] = useState<Set<string>>(() => new Set());
   
   const [activeTabId, setActiveTabId] = useState('tab-1');
   const activeTab = tabs.find(t => t.id === activeTabId) || tabs[0];
@@ -425,8 +426,21 @@ export default function App() {
       const { projectId, step } = e.detail;
       setTabs(prev => prev.map(t => t.id === projectId ? { ...t, activeStep: step } : t));
     };
+    const handleProjectStart = (e: any) => {
+      const { projectId, step } = e.detail;
+      setPendingPlayIds(prev => {
+        const next = new Set(prev);
+        next.delete(projectId);
+        return next;
+      });
+      setTabs(prev => prev.map(t => t.id === projectId ? { ...t, isPlaying: true, activeStep: step } : t));
+    };
     window.addEventListener('step', handleStep);
-    return () => window.removeEventListener('step', handleStep);
+    window.addEventListener('project-start', handleProjectStart);
+    return () => {
+      window.removeEventListener('step', handleStep);
+      window.removeEventListener('project-start', handleProjectStart);
+    };
   }, []);
 
   useEffect(() => {
@@ -589,6 +603,8 @@ export default function App() {
   };
 
   const resetWorkbench = () => {
+    engineManager.stopAllProjects();
+    setPendingPlayIds(new Set());
     const fresh = createCodexSongTab();
     setTabs([fresh]);
     setActiveTabId(fresh.id);
@@ -611,7 +627,12 @@ export default function App() {
 
   const deleteTab = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
-    engineManager.getProject(id).stop();
+    engineManager.stopProject(id);
+    setPendingPlayIds(prev => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
 
     if (tabs.length === 1) {
       const fresh = createCodexSongTab();
@@ -632,17 +653,27 @@ export default function App() {
 
   const togglePlayTab = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
-    const engine = engineManager.getProject(id);
     const tab = tabs.find(t => t.id === id);
     if (!tab) return;
+    const engine = engineManager.getProject(id);
+    const isPending = pendingPlayIds.has(id);
     engine.setStyle(tab.styleId);
     
-    if (!tab.isPlaying) {
-      engine.play();
-      setTabs(prev => prev.map(t => t.id === id ? { ...t, isPlaying: true } : t));
+    if (!tab.isPlaying && !isPending) {
+      const startMode = engineManager.startProject(id);
+      if (startMode === 'started') {
+        setTabs(prev => prev.map(t => t.id === id ? { ...t, isPlaying: true, activeStep: 0 } : t));
+      } else {
+        setPendingPlayIds(prev => new Set(prev).add(id));
+      }
     } else {
-      engine.stop();
-      setTabs(prev => prev.map(t => t.id === id ? { ...t, isPlaying: false, activeStep: 0 } : t));
+      engineManager.stopProject(id);
+      setPendingPlayIds(prev => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      setTabs(prev => prev.map(t => t.id === id ? { ...t, isPlaying: false } : t));
     }
   };
 
@@ -917,11 +948,15 @@ export default function App() {
       }
 
       engineManager.init();
+      engineManager.stopAllProjects();
+      setPendingPlayIds(new Set());
       const importedRecordedSounds = await Promise.all((data.recordedSounds || []).map(deserializeSoundDef));
       const importedTabs = await Promise.all(data.tabs.map(async (tab) => ({
         ...tab,
         slots: await Promise.all(tab.slots.map((slot) => slot ? deserializeSoundDef(slot) : null)),
         fxSlots: tab.moduleFx ?? tab.fxSlots ?? new Array(7).fill(null).map(defaultFx),
+        isPlaying: false,
+        activeStep: 0,
       })));
 
       setRecordedSounds(importedRecordedSounds);
@@ -980,8 +1015,12 @@ export default function App() {
       engine.setSlots(newSlots);
       
       if (!activeTab.isPlaying) {
-         engine.play();
-         setTabs(prev => prev.map(t => t.id === activeTab.id ? { ...t, isPlaying: true } : t));
+         const startMode = engineManager.startProject(activeTab.id);
+         if (startMode === 'started') {
+           setTabs(prev => prev.map(t => t.id === activeTab.id ? { ...t, isPlaying: true, activeStep: 0 } : t));
+         } else {
+           setPendingPlayIds(prev => new Set(prev).add(activeTab.id));
+         }
       }
     } catch (err) {
       console.error('Drop error', err);
@@ -1382,7 +1421,9 @@ export default function App() {
         isDayMode ? "border-slate-900/10 bg-white/80" : "border-white/5 bg-black/40"
       )}>
         <div className="flex items-center gap-2 overflow-x-auto scrollbar-none pb-0 w-full md:w-auto">
-          {tabs.map((tab) => (
+          {tabs.map((tab) => {
+            const isQueued = pendingPlayIds.has(tab.id);
+            return (
              <div 
                key={tab.id}
                onClick={() => setActiveTabId(tab.id)}
@@ -1399,10 +1440,10 @@ export default function App() {
                   onClick={(e) => togglePlayTab(e, tab.id)}
                   className={cn(
                     "w-5 h-5 rounded flex items-center justify-center transition-colors",
-                    tab.isPlaying ? "bg-emerald-500 text-white shadow-[0_0_10px_rgba(16,185,129,0.3)]" : isDayMode ? "bg-slate-900/10 text-slate-700 hover:bg-slate-900/15" : "bg-white/10 text-white hover:bg-white/20"
+                    tab.isPlaying ? "bg-emerald-500 text-white shadow-[0_0_10px_rgba(16,185,129,0.3)]" : isQueued ? "bg-amber-500 text-white animate-pulse" : isDayMode ? "bg-slate-900/10 text-slate-700 hover:bg-slate-900/15" : "bg-white/10 text-white hover:bg-white/20"
                   )}
                 >
-                  {tab.isPlaying ? <Square className="w-2.5 h-2.5" fill="currentColor"/> : <Play className="w-2.5 h-2.5 ml-0.5" fill="currentColor"/>}
+                  {tab.isPlaying || isQueued ? <Square className="w-2.5 h-2.5" fill="currentColor"/> : <Play className="w-2.5 h-2.5 ml-0.5" fill="currentColor"/>}
                 </button>
                 <span>{tab.name}</span>
                 <span className="flex gap-0.5 w-3 mt-0.5 opacity-80">
@@ -1426,7 +1467,8 @@ export default function App() {
                   <X className="w-3 h-3" strokeWidth={3} />
                 </button>
              </div>
-          ))}
+            );
+          })}
 
           <button 
              onClick={addNewTab}
@@ -1482,8 +1524,12 @@ export default function App() {
           </button>
         </div>
 
-        <div className="hidden md:flex items-center gap-3 text-[10px] font-medium uppercase tracking-widest pb-3 h-full mb-1">
-          <div className={cn("flex items-center gap-2 px-2 py-1.5 rounded border", isDayMode ? "bg-slate-900/5 border-slate-900/10" : "bg-white/5 border-white/5")}>
+      </header>
+
+      {/* Main Content Area */}
+      <main className="min-h-0 flex-1 w-full flex flex-col p-6 gap-5 overflow-hidden">
+        <section className="shrink-0 flex items-center gap-3 overflow-x-auto pb-1 text-[10px] font-medium uppercase tracking-widest scrollbar-none">
+          <div className={cn("flex h-10 shrink-0 items-center gap-2 rounded border px-3", isDayMode ? "bg-slate-900/5 border-slate-900/10" : "bg-white/5 border-white/5")}>
             <span className={mutedTextClass}>Preset</span>
             <select
               value={selectedStyleId}
@@ -1500,53 +1546,37 @@ export default function App() {
           </div>
           <button
             onClick={shuffleActiveTab}
-            className={cn("flex items-center gap-1.5 px-2 py-1.5 rounded border transition-colors", softButtonClass)}
+            className={cn("flex h-10 shrink-0 items-center gap-1.5 rounded border px-3 transition-colors", softButtonClass)}
           >
             <Shuffle size={11} />
             Shuffle
           </button>
           <button
             onClick={reverseActiveTab}
-            className={cn("flex items-center gap-1.5 px-2 py-1.5 rounded border transition-colors", softButtonClass)}
+            className={cn("flex h-10 shrink-0 items-center gap-1.5 rounded border px-3 transition-colors", softButtonClass)}
             title="Reverse the current page sequence"
           >
             <RotateCcw size={11} />
             Reverse
           </button>
           <button
-            onClick={() => persistWorkbench()}
-            className={cn("flex items-center gap-1.5 px-2 py-1.5 rounded border transition-colors", softButtonClass)}
-          >
-            <Save size={11} />
-            {saveStatus === 'saved' ? 'Saved' : 'Save'}
-          </button>
-          <button
-            onClick={loadWorkbench}
-            className={cn("px-2 py-1.5 rounded border transition-colors", softButtonClass)}
-          >
-            {saveStatus === 'loaded' ? 'Loaded' : 'Load'}
-          </button>
-          <button
             onClick={resetWorkbench}
-            className={cn("flex items-center gap-1.5 px-2 py-1.5 rounded border transition-colors", softButtonClass)}
+            className={cn("flex h-10 shrink-0 items-center gap-1.5 rounded border px-3 transition-colors", softButtonClass)}
           >
             <RotateCcw size={11} />
             Reset
           </button>
           <button
             onClick={() => setColorMode(prev => prev === 'night' ? 'day' : 'night')}
-            className={cn("flex items-center gap-1.5 px-2 py-1.5 rounded border transition-colors", softButtonClass)}
+            className={cn("flex h-10 shrink-0 items-center gap-1.5 rounded border px-3 transition-colors", softButtonClass)}
             aria-label={isDayMode ? 'Switch to night mode' : 'Switch to day mode'}
             title={isDayMode ? 'Switch to night mode' : 'Switch to day mode'}
           >
             {isDayMode ? <Moon size={11} /> : <Sun size={11} />}
             {isDayMode ? 'Night' : 'Day'}
           </button>
-        </div>
-      </header>
+        </section>
 
-      {/* Main Content Area */}
-      <main className="min-h-0 flex-1 w-full flex flex-col p-6 gap-5 overflow-hidden">
         <section className="shrink-0 flex flex-col gap-3">
           <div className="flex items-center gap-2">
             <Wand2 className={cn("w-4 h-4", mutedTextClass)} />
