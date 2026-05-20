@@ -3,6 +3,7 @@ import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus, RotateCcw, Shu
 import { motion, AnimatePresence } from 'motion/react';
 import { AUDIO_STYLES, AVAILABLE_SOUNDS, AudioStyleId, SoundDef, engineManager, FxParams, defaultFx, KEYBOARD_NOTES } from './audio';
 import { cn } from './lib/utils';
+import { createShowControlClient, type AudioFrameMessage, type ControlCommand } from './lib/showControlClient';
 
 const KEYBOARD_INSTRUMENT_MODES = [
   { id: 'piano', name: 'Piano', color: 'bg-blue-500', waveform: 'sine' as OscillatorType },
@@ -109,6 +110,45 @@ interface StylePreset {
 }
 
 type ColorMode = 'night' | 'day';
+type AudioTransportState = 'stopped' | 'playing' | 'paused';
+
+type MixerAudioTelemetry = AudioFrameMessage & {
+  beat: number;
+  activeStep: number;
+  transport: AudioTransportState;
+  activePreset: string;
+  styleId: string;
+  masterLevel: number;
+  slotLevels: number[];
+  slotActivity: number[];
+  stepProgress: number;
+  styleEnergy: number;
+  tabCount: number;
+};
+
+const clampUnit = (value: number) => Math.max(0, Math.min(1, value));
+const average = (values: number[]) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+const BAND_SHAPE = [0.22, 0.45, 0.74, 1, 0.74, 0.45, 0.22];
+const CATEGORY_BAND_CENTERS: Record<string, number> = {
+  beat: 1,
+  bass: 3,
+  melody: 7,
+  theme: 8,
+  animal: 9,
+  custom: 6,
+  effect: 12,
+  experimental: 14,
+};
+const CATEGORY_IMPACT: Record<string, number> = {
+  beat: 1,
+  bass: 0.92,
+  melody: 0.8,
+  theme: 0.84,
+  animal: 0.78,
+  custom: 0.76,
+  effect: 0.68,
+  experimental: 0.64,
+};
 
 const makeFx = (overrides: Partial<FxParams> = {}): FxParams => ({
   ...defaultFx(),
@@ -416,6 +456,103 @@ const createStyleTab = (preset: StylePreset, id = 'tab-1', styleId: AudioStyleId
 
 const createCodexSongTab = (): TabData => createStyleTab(STYLE_PRESETS[0]);
 
+const hasStepHit = (slot: SoundDef | null, step: number) => {
+  if (!slot) return false;
+  const stepData = slot.pattern[step];
+  return Boolean(stepData && (stepData.note || stepData.drum || stepData.exp));
+};
+
+const getStepProgress = (bpm: number) => {
+  const safeBpm = Math.max(1, bpm || 120);
+  const stepDurationMs = 60000 / safeBpm / 4;
+  return (performance.now() % stepDurationMs) / stepDurationMs;
+};
+
+const buildFrequencyBands = (
+  tab: TabData,
+  style: StylePreset,
+  masterLevel: number,
+  slotLevels: number[],
+  slotActivity: number[],
+  stepProgress: number,
+) => {
+  const bands = style.energy.map((energy, index) => clampUnit(0.08 + energy * 0.58 + index * 0.003));
+  const pulse = Math.pow(Math.sin(Math.PI * clampUnit(stepProgress)), 2);
+  const activeStep = tab.activeStep % 16;
+  const beatLift = tab.isPlaying ? 0.16 + pulse * 0.22 : 0.04;
+  bands[activeStep] = clampUnit((bands[activeStep] ?? 0) + beatLift);
+  bands[(activeStep + 4) % 16] = clampUnit((bands[(activeStep + 4) % 16] ?? 0) + beatLift * 0.38);
+  bands[(activeStep + 8) % 16] = clampUnit((bands[(activeStep + 8) % 16] ?? 0) + beatLift * 0.16);
+
+  tab.slots.forEach((slot, index) => {
+    if (!slot) return;
+    const level = slotLevels[index] ?? 0;
+    if (level <= 0) return;
+
+    const activity = slotActivity[index] ?? 0;
+    const impact = level * (0.16 + activity * 0.34) * (CATEGORY_IMPACT[slot.category] ?? 0.7);
+    const center = CATEGORY_BAND_CENTERS[slot.category] ?? 8;
+
+    for (let offset = -3; offset <= 3; offset += 1) {
+      const bandIndex = center + offset;
+      if (bandIndex < 0 || bandIndex >= bands.length) continue;
+      bands[bandIndex] = clampUnit((bands[bandIndex] ?? 0) + impact * BAND_SHAPE[offset + 3]);
+    }
+  });
+
+  const lift = masterLevel * (tab.isPlaying ? 0.14 : 0.06);
+  return bands.map((band, index) => clampUnit(band + lift * (index < 4 ? 0.28 : index < 10 ? 0.16 : 0.1)));
+};
+
+const buildMixerTelemetry = (
+  tab: TabData,
+  style: StylePreset,
+  bpm: number,
+  tabCount: number,
+): MixerAudioTelemetry => {
+  const masterLevel = clampUnit((tab.masterFx.volume ?? 0) / 100);
+  const slotLevels = tab.fxSlots.map((fx, index) => (tab.mutedSlots[index] ? 0 : clampUnit((fx?.volume ?? 0) / 100)));
+  const slotActivity = tab.slots.map((slot) => (tab.isPlaying ? (hasStepHit(slot, tab.activeStep) ? 1 : 0) : 0));
+  const activeSlotCount = tab.slots.filter(Boolean).length;
+  const activeHits = slotActivity.reduce((sum, value) => sum + value, 0);
+  const slotMean = average(slotLevels);
+  const stepEnergy = style.energy[tab.activeStep] ?? 0.5;
+  const stepProgress = getStepProgress(bpm);
+  const pulse = tab.isPlaying ? Math.pow(Math.sin(Math.PI * clampUnit(stepProgress)), 2) : 0.12;
+  const level = clampUnit(0.06 + masterLevel * 0.38 + slotMean * 0.24 + stepEnergy * 0.18 + (activeHits / Math.max(1, activeSlotCount)) * 0.1 + pulse * 0.12);
+  const rms = clampUnit(level * (tab.isPlaying ? 0.84 + stepEnergy * 0.08 : 0.66));
+  const peak = clampUnit(Math.max(level, rms + (tab.isPlaying ? 0.12 + pulse * 0.08 : 0.06)));
+  const muted = !tab.isPlaying || masterLevel <= 0.01;
+  const frequencyBands = buildFrequencyBands(tab, style, masterLevel, slotLevels, slotActivity, stepProgress);
+
+  return {
+    type: 'mixer.audioFrame',
+    sourceId: tab.id,
+    deviceId: 'mixer-target-123',
+    displayName: `${tab.name} · ${style.name}`,
+    timestamp: Date.now(),
+    level,
+    rms,
+    peak,
+    gain: masterLevel,
+    muted,
+    speaking: !muted && (level > 0.14 || activeHits > 0),
+    frequencyBands,
+    beat: tab.isPlaying ? tab.activeStep % 4 : 0,
+    activeStep: tab.activeStep,
+    transport: tab.isPlaying ? 'playing' : 'stopped',
+    activePreset: style.name,
+    styleId: style.id,
+    bpm,
+    masterLevel,
+    slotLevels,
+    slotActivity,
+    stepProgress,
+    styleEnergy: stepEnergy,
+    tabCount,
+  };
+};
+
 const CLIP_COLOR_CLASSES = ['bg-emerald-500', 'bg-sky-500', 'bg-amber-500', 'bg-fuchsia-500', 'bg-rose-500', 'bg-lime-500'];
 const TIMELINE_TRACKS = 5;
 const DEFAULT_TIMELINE_SECONDS = 32;
@@ -589,6 +726,7 @@ export default function App() {
   const [isTimelinePlaying, setIsTimelinePlaying] = useState(false);
   const [timelineDuration, setTimelineDuration] = useState(DEFAULT_TIMELINE_SECONDS);
   const [timelineLoopRange, setTimelineLoopRange] = useState({ start: 0, end: 8 });
+  const [bpm, setBpm] = useState(engineManager.bpm);
   
   const [activeTabId, setActiveTabId] = useState('tab-1');
   const activeTab = tabs.find(t => t.id === activeTabId) || tabs[0];
@@ -646,6 +784,45 @@ export default function App() {
   const liveFxTimeoutsRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const liveFxControlsRef = useRef(liveFxControls);
   const recordStartTimeRef = useRef<number>(0);
+  const showControlRef = useRef<ReturnType<typeof createShowControlClient> | null>(null);
+  const showControlClientIdRef = useRef(`dj-music-editor-${crypto.randomUUID().slice(0, 8)}`);
+  const showControlCommandRef = useRef<(command: ControlCommand) => void>(() => undefined);
+  const [showControlStatus, setShowControlStatus] = useState<'connecting' | 'connected' | 'offline'>('connecting');
+  const activeTabRef = useRef(activeTab);
+  const activeStyleRef = useRef(activeStyle);
+  const tabsRef = useRef(tabs);
+  const selectedStyleIdRef = useRef(selectedStyleId);
+  const bpmRef = useRef(bpm);
+  const showControlStatusRef = useRef(showControlStatus);
+  const timelineStateRef = useRef({
+    viewMode,
+    isTimelinePlaying,
+    timelinePlayhead,
+    timelineDuration,
+    timelineLoopRange,
+  });
+
+  useEffect(() => {
+    activeTabRef.current = activeTab;
+    activeStyleRef.current = activeStyle;
+    tabsRef.current = tabs;
+    selectedStyleIdRef.current = selectedStyleId;
+    bpmRef.current = bpm;
+  }, [activeTab, activeStyle, selectedStyleId, tabs, bpm]);
+
+  useEffect(() => {
+    showControlStatusRef.current = showControlStatus;
+  }, [showControlStatus]);
+
+  useEffect(() => {
+    timelineStateRef.current = {
+      viewMode,
+      isTimelinePlaying,
+      timelinePlayhead,
+      timelineDuration,
+      timelineLoopRange,
+    };
+  }, [viewMode, isTimelinePlaying, timelinePlayhead, timelineDuration, timelineLoopRange]);
 
   useEffect(() => {
     const handleStep = (e: any) => {
@@ -775,17 +952,18 @@ export default function App() {
     setSaveStatus('loaded');
   };
 
-  const applyStylePreset = (styleId: string) => {
+  const applyStylePreset = (styleId: string, tabId = activeTabId) => {
     const preset = STYLE_PRESETS.find((style) => style.id === styleId) ?? STYLE_PRESETS[0];
-    const styledTab = createStyleTab(preset, activeTab.id, activeTab.styleId);
+    const targetTab = tabs.find(tab => tab.id === tabId) ?? activeTab;
+    const styledTab = createStyleTab(preset, targetTab.id, targetTab.styleId);
     const nextTab = {
       ...styledTab,
       name: preset.name,
-      isPlaying: activeTab.isPlaying,
-      activeStep: activeTab.activeStep,
+      isPlaying: targetTab.isPlaying,
+      activeStep: targetTab.activeStep,
     };
     setSelectedStyleId(styleId);
-    setTabs(prev => prev.map(t => t.id === activeTab.id ? nextTab : t));
+    setTabs(prev => prev.map(t => t.id === targetTab.id ? nextTab : t));
     syncProjectEngine(nextTab);
   };
 
@@ -1022,6 +1200,196 @@ export default function App() {
         : event
     )));
   };
+
+  const resolveCommandTabId = (command: ControlCommand) => {
+    if (typeof command.value === 'object' && command.value && 'tabId' in command.value) {
+      const tabId = String((command.value as { tabId?: unknown }).tabId);
+      if (tabs.some(tab => tab.id === tabId)) return tabId;
+    }
+    if (typeof command.target === 'string' && tabs.some(tab => tab.id === command.target)) return command.target;
+    return activeTabId;
+  };
+
+  const resolveCommandSlotIndex = (command: ControlCommand) => {
+    const value = command.value;
+    if (typeof value === 'object' && value && 'slotIndex' in value) {
+      const slotIndex = Number((value as { slotIndex?: unknown }).slotIndex);
+      if (Number.isInteger(slotIndex) && slotIndex >= 0 && slotIndex < 7) return slotIndex;
+    }
+
+    const targetMatch = typeof command.target === 'string' ? command.target.match(/^slot[-:](\d+)$/i) : null;
+    if (!targetMatch) return null;
+    const parsed = Number(targetMatch[1]);
+    if (!Number.isInteger(parsed)) return null;
+    if (parsed >= 1 && parsed <= 7) return parsed - 1;
+    if (parsed >= 0 && parsed < 7) return parsed;
+    return null;
+  };
+
+  const setMutedSlotsForControl = (tabId: string, muted: boolean, slotIndex: number | null) => {
+    setTabs(prev => prev.map(tab => {
+      if (tab.id !== tabId) return tab;
+      const mutedSlots = [...tab.mutedSlots];
+      if (slotIndex === null) {
+        mutedSlots.fill(muted);
+      } else {
+        mutedSlots[slotIndex] = muted;
+      }
+      engineManager.getProject(tab.id).setMutedSlots(mutedSlots);
+      return { ...tab, mutedSlots };
+    }));
+  };
+
+  const startTabFromControl = (id = activeTabId) => {
+    const tab = tabs.find(t => t.id === id);
+    if (!tab || tab.isPlaying || pendingPlayIds.has(id)) return;
+    const engine = engineManager.getProject(id);
+    engine.setStyle(tab.styleId);
+    const startMode = engineManager.startProject(id);
+    recordArrangementStart(tab);
+    if (startMode === 'started') {
+      setTabs(prev => prev.map(t => t.id === id ? { ...t, isPlaying: true, activeStep: 0 } : t));
+    } else {
+      setPendingPlayIds(prev => new Set(prev).add(id));
+    }
+  };
+
+  const stopTabFromControl = (id = activeTabId) => {
+    recordArrangementStop(id);
+    engineManager.stopProject(id);
+    setPendingPlayIds(prev => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+    setTabs(prev => prev.map(t => t.id === id ? { ...t, isPlaying: false } : t));
+  };
+
+  const applyShowControlCommand = (command: ControlCommand) => {
+    if (command.module && command.module !== 'audio' && command.module !== 'show') return;
+    const value = command.value;
+    const targetTabId = resolveCommandTabId(command);
+
+    if (command.command === 'play') {
+      startTabFromControl(targetTabId);
+    } else if (command.command === 'pause' || command.command === 'stop') {
+      stopTabFromControl(targetTabId);
+    } else if (command.command === 'reset') {
+      resetWorkbench();
+    } else if (command.command === 'setPreset' && typeof value === 'string') {
+      const preset = STYLE_PRESETS.find(style => style.id === value || style.name === value);
+      if (preset) applyStylePreset(preset.id, targetTabId);
+    } else if (command.command === 'setActiveTab' && typeof value === 'string' && tabs.some(tab => tab.id === value)) {
+      setActiveTabId(value);
+    } else if (command.command === 'setBpm') {
+      const nextBpm = typeof value === 'number'
+        ? value
+        : typeof value === 'object' && value && 'bpm' in value
+          ? Number((value as { bpm?: unknown }).bpm)
+          : Number(value);
+      if (Number.isFinite(nextBpm)) {
+        const normalizedBpm = Math.max(40, Math.min(240, Math.round(nextBpm)));
+        engineManager.bpm = normalizedBpm;
+        setBpm(normalizedBpm);
+      }
+    } else if (command.command === 'setMute') {
+      const muted = typeof value === 'boolean'
+        ? value
+        : typeof value === 'object' && value && 'muted' in value
+          ? Boolean((value as { muted?: unknown }).muted)
+          : true;
+      setMutedSlotsForControl(targetTabId, muted, resolveCommandSlotIndex(command));
+    } else if (command.command === 'setMasterLevel' && typeof value === 'number') {
+      const volume = Math.max(0, Math.min(100, Math.round(value * 100)));
+      setTabs(prev => prev.map(tab => {
+        if (tab.id !== targetTabId) return tab;
+        const masterFx = { ...tab.masterFx, volume };
+        engineManager.getProject(tab.id).setMasterFxParams(masterFx);
+        return { ...tab, masterFx };
+      }));
+    }
+  };
+
+  showControlCommandRef.current = applyShowControlCommand;
+
+  useEffect(() => {
+    showControlRef.current = createShowControlClient({
+      module: 'audio',
+      clientId: showControlClientIdRef.current,
+      role: 'dj',
+      capabilities: ['module.statePatch', 'mixer.audioFrame', 'control.command', 'audio.transport', 'audio.presets'],
+      onCommand: (command) => showControlCommandRef.current(command),
+      onStatus: setShowControlStatus,
+    });
+
+    return () => showControlRef.current?.close();
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const client = showControlRef.current;
+      const tab = activeTabRef.current;
+      const style = activeStyleRef.current;
+      if (!client || !tab || !style) return;
+
+      const timeline = timelineStateRef.current;
+      const patch = {
+        status: 'online',
+        projectName: 'Music Editor',
+        transport: tab.isPlaying ? 'playing' : timeline.isTimelinePlaying ? 'playing' : 'stopped',
+        bpm: bpmRef.current,
+        masterLevel: clampUnit((tab.masterFx.volume ?? 0) / 100),
+        activeTab: tab.id,
+        activePreset: style.name,
+        activePresetId: selectedStyleIdRef.current,
+        activeStep: tab.activeStep,
+        activeSourceId: tab.id,
+        slots: tab.slots.map((slot, index) => ({
+          id: slot?.id || `empty-${index}`,
+          name: slot?.name || 'Empty',
+          category: slot?.category || 'empty',
+          muted: Boolean(tab.mutedSlots[index]),
+          level: tab.mutedSlots[index] ? 0 : clampUnit((tab.fxSlots[index]?.volume ?? 0) / 100),
+        })),
+        fx: {
+          compressor: tab.masterFx.compressor,
+          reverb: tab.masterFx.reverb,
+          delay: tab.masterFx.delay,
+        },
+        arrangementSummary: {
+          tabCount: tabsRef.current.length,
+          styleId: tab.styleId,
+          presetId: selectedStyleIdRef.current,
+        },
+        timeline: {
+          viewMode: timeline.viewMode,
+          isPlaying: timeline.isTimelinePlaying,
+          playhead: timeline.timelinePlayhead,
+          duration: timeline.timelineDuration,
+          loopRange: timeline.timelineLoopRange,
+        },
+      };
+      client.publishState(patch);
+    }, 500);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (showControlStatusRef.current !== 'connected') return;
+      const client = showControlRef.current;
+      const tab = activeTabRef.current;
+      const style = activeStyleRef.current;
+      if (!client || !tab || !style) return;
+
+      client.publishAudioFrame(
+        buildMixerTelemetry(tab, style, bpmRef.current, tabsRef.current.length),
+      );
+    }, 33);
+
+    return () => window.clearInterval(timer);
+  }, []);
 
   const startGlobalRecording = () => {
     try {
