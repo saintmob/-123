@@ -1285,11 +1285,27 @@ export class GlobalEngineManager {
     if (!this.ctx) return;
     while (this.nextNoteTime < this.ctx.currentTime + this.scheduleAheadTime) {
       this.activatePendingAtMeasureStart();
+      if (this.step === 0) {
+        this.dispatchBpmLoopStart(this.nextNoteTime);
+      }
       this.projects.forEach(project => {
         project.scheduleStep(this.step, this.nextNoteTime);
       });
       this.nextStep();
     }
+  }
+
+  private dispatchBpmLoopStart(scheduledTime: number) {
+    if (!this.ctx) return;
+    const event = new CustomEvent('bpm-loop-start', {
+      detail: {
+        bpm: this.bpm,
+        step: this.step,
+        scheduledTime,
+        currentTime: this.ctx.currentTime,
+      },
+    });
+    window.dispatchEvent(event);
   }
 
   private dispatchProjectStart(project: ProjectEngine) {

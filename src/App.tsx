@@ -58,6 +58,7 @@ interface TabData {
 }
 
 type ViewMode = 'matrix' | 'timeline';
+type GlobalRecordingState = 'idle' | 'waiting' | 'recording' | 'stopping';
 
 interface ArrangementEvent {
   id: string;
@@ -719,6 +720,7 @@ export default function App() {
   const [pendingPlayIds, setPendingPlayIds] = useState<Set<string>>(() => new Set());
   const [viewMode, setViewMode] = useState<ViewMode>('matrix');
   const [isGlobalRecording, setIsGlobalRecording] = useState(false);
+  const [globalRecordingState, setGlobalRecordingState] = useState<GlobalRecordingState>('idle');
   const [arrangementEvents, setArrangementEvents] = useState<ArrangementEvent[]>([]);
   const [timelineClips, setTimelineClips] = useState<TimelineClip[]>([]);
   const [selectedTimelineClipId, setSelectedTimelineClipId] = useState<string | null>(null);
@@ -757,6 +759,10 @@ export default function App() {
   const globalRecordStartedAtRef = useRef<number>(0);
   const globalRecorderRef = useRef<MediaRecorder | null>(null);
   const globalRecordChunksRef = useRef<Blob[]>([]);
+  const globalRecordingStateRef = useRef<GlobalRecordingState>('idle');
+  const globalRecordTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const startGlobalRecordingRef = useRef<() => void>(() => {});
+  const stopGlobalRecordingRef = useRef<() => void>(() => {});
   const timelineGridRef = useRef<HTMLDivElement>(null);
   const timelineEditRef = useRef<TimelinePointerEdit | null>(null);
   const timelineTransportEditRef = useRef<TimelineTransportEdit | null>(null);
@@ -1391,7 +1397,20 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, []);
 
+  const clearGlobalRecordTimer = () => {
+    if (!globalRecordTimerRef.current) return;
+    clearTimeout(globalRecordTimerRef.current);
+    globalRecordTimerRef.current = null;
+  };
+
+  const setGlobalRecordState = (state: GlobalRecordingState) => {
+    globalRecordingStateRef.current = state;
+    setGlobalRecordingState(state);
+    setIsGlobalRecording(state === 'recording' || state === 'stopping');
+  };
+
   const startGlobalRecording = () => {
+    if (globalRecorderRef.current?.state === 'recording') return;
     try {
       engineManager.init();
       const stream = engineManager.startCaptureStream();
@@ -1412,7 +1431,10 @@ export default function App() {
         const blob = new Blob(globalRecordChunksRef.current, { type: mimeType || 'audio/webm' });
         globalRecordChunksRef.current = [];
         globalRecordStartedAtRef.current = 0;
-        if (!blob.size) return;
+        if (!blob.size) {
+          setGlobalRecordState('idle');
+          return;
+        }
 
         try {
           engineManager.init();
@@ -1447,38 +1469,92 @@ export default function App() {
         } catch (err) {
           console.error('Global recording decode failed', err);
           alert('录制完成，但音频生成失败，请再试一次。');
+        } finally {
+          setGlobalRecordState('idle');
         }
       };
 
       recorder.start();
       globalRecorderRef.current = recorder;
-      setIsGlobalRecording(true);
+      setGlobalRecordState('recording');
     } catch (err) {
       engineManager.stopCaptureStream();
       globalRecorderRef.current = null;
+      setGlobalRecordState('idle');
       console.error('Global recording failed', err);
       alert('无法开始全局录制，请先点击播放一个标签后再试。');
     }
   };
 
   const stopGlobalRecording = () => {
-    setIsGlobalRecording(false);
+    clearGlobalRecordTimer();
     if (globalRecorderRef.current?.state === 'recording') {
       globalRecorderRef.current.requestData();
       globalRecorderRef.current.stop();
     } else {
       engineManager.stopCaptureStream();
       globalRecorderRef.current = null;
+      setGlobalRecordState('idle');
     }
   };
 
-  const toggleGlobalRecording = () => {
-    if (isGlobalRecording) {
-      stopGlobalRecording();
-    } else {
-      startGlobalRecording();
+  const handleGlobalRecordingToggle = () => {
+    if (globalRecordingStateRef.current === 'waiting') {
+      clearGlobalRecordTimer();
+      setGlobalRecordState('idle');
+      return;
     }
+
+    if (globalRecordingStateRef.current === 'recording') {
+      clearGlobalRecordTimer();
+      setGlobalRecordState('stopping');
+      return;
+    }
+
+    if (globalRecordingStateRef.current === 'stopping') return;
+
+    engineManager.init();
+    clearGlobalRecordTimer();
+    setGlobalRecordState('waiting');
   };
+
+  startGlobalRecordingRef.current = startGlobalRecording;
+  stopGlobalRecordingRef.current = stopGlobalRecording;
+
+  useEffect(() => {
+    const handleBpmLoopStart = (event: Event) => {
+      const detail = (event as CustomEvent<{ scheduledTime?: number; currentTime?: number }>).detail ?? {};
+      const scheduledTime = detail.scheduledTime ?? engineManager.ctx?.currentTime ?? 0;
+      const currentTime = detail.currentTime ?? engineManager.ctx?.currentTime ?? scheduledTime;
+      const delayMs = Math.max(0, (scheduledTime - currentTime) * 1000);
+
+      if (globalRecordingStateRef.current === 'waiting') {
+        clearGlobalRecordTimer();
+        globalRecordTimerRef.current = setTimeout(() => {
+          globalRecordTimerRef.current = null;
+          if (globalRecordingStateRef.current === 'waiting') {
+            startGlobalRecordingRef.current();
+          }
+        }, delayMs);
+      }
+
+      if (globalRecordingStateRef.current === 'stopping') {
+        clearGlobalRecordTimer();
+        globalRecordTimerRef.current = setTimeout(() => {
+          globalRecordTimerRef.current = null;
+          if (globalRecordingStateRef.current === 'stopping') {
+            stopGlobalRecordingRef.current();
+          }
+        }, delayMs);
+      }
+    };
+
+    window.addEventListener('bpm-loop-start', handleBpmLoopStart);
+    return () => {
+      window.removeEventListener('bpm-loop-start', handleBpmLoopStart);
+      clearGlobalRecordTimer();
+    };
+  }, []);
 
   interface SerializableSoundDef extends Omit<SoundDef, 'buffer'> {
     bufferBase64?: string;
@@ -1503,6 +1579,16 @@ export default function App() {
     version: '1.0';
     tabs: SerializedTabData[];
     recordedSounds: SerializableSoundDef[];
+    timeline?: {
+      duration: number;
+      playhead: number;
+      loopRange: {
+        start: number;
+        end: number;
+      };
+      clips: TimelineClip[];
+      selectedClipId?: string | null;
+    };
     userSettings: {
       activeTabId: string;
       keyboardInstrumentMode: string;
@@ -1634,6 +1720,13 @@ export default function App() {
       version: '1.0',
       tabs: tabsPayload,
       recordedSounds: recordedPayload,
+      timeline: {
+        duration: timelineDuration,
+        playhead: timelinePlayheadRef.current,
+        loopRange: timelineLoopRange,
+        clips: timelineClips,
+        selectedClipId: selectedTimelineClipId,
+      },
       userSettings: {
         activeTabId,
         keyboardInstrumentMode,
@@ -1692,6 +1785,32 @@ export default function App() {
       setActiveTabId(data.userSettings?.activeTabId || importedTabs[0]?.id || 'tab-1');
       setKeyboardInstrumentMode(data.userSettings?.keyboardInstrumentMode || KEYBOARD_INSTRUMENT_MODES[0].id);
       setIsKeyboardVisible(Boolean(data.userSettings?.isKeyboardVisible));
+      if (data.timeline) {
+        const nextDuration = Math.max(1, Math.min(600, Number(data.timeline.duration) || DEFAULT_TIMELINE_SECONDS));
+        const nextLoopStart = Math.max(0, Math.min(data.timeline.loopRange?.start ?? 0, nextDuration - 0.25));
+        const nextLoopEnd = Math.max(nextLoopStart + 0.25, Math.min(data.timeline.loopRange?.end ?? Math.min(8, nextDuration), nextDuration));
+        const nextPlayhead = Math.max(0, Math.min(data.timeline.playhead ?? nextLoopStart, nextDuration));
+        const nextClips = (data.timeline.clips || []).map((clip) => {
+          const duration = Math.max(0.5, Math.min(clip.duration, nextDuration));
+          return {
+            ...clip,
+            track: Math.max(0, Math.min(TIMELINE_TRACKS - 1, clip.track)),
+            start: Math.max(0, Math.min(clip.start, Math.max(0, nextDuration - duration))),
+            duration,
+            trimStart: Math.max(0, clip.trimStart),
+          };
+        });
+        setTimelineDuration(nextDuration);
+        setTimelineLoopRange({ start: nextLoopStart, end: nextLoopEnd });
+        setTimelinePlayhead(nextPlayhead);
+        timelinePlayheadRef.current = nextPlayhead;
+        timelineOffsetRef.current = nextPlayhead;
+        setTimelineClips(nextClips);
+        setSelectedTimelineClipId(data.timeline.selectedClipId ?? null);
+      } else {
+        setTimelineClips([]);
+        setSelectedTimelineClipId(null);
+      }
 
       importedTabs.forEach((tab) => {
         const engine = engineManager.getProject(tab.id);
@@ -2134,12 +2253,48 @@ export default function App() {
     };
   }, [timelineClips, recordedSounds]);
 
+  const deleteRecordedSound = (soundId: string) => {
+    if (isTimelinePlaying) stopTimelinePlayback(false);
+    setRecordedSounds(prev => prev.filter(sound => sound.id !== soundId));
+    setTimelineClips(prev => prev.filter(clip => clip.soundId !== soundId));
+    setSelectedTimelineClipId(prev => {
+      const selectedClip = timelineClips.find(clip => clip.id === prev);
+      return selectedClip?.soundId === soundId ? null : prev;
+    });
+  };
+
+  const clearRecordedSounds = () => {
+    if (recordedSounds.length === 0) return;
+    if (isTimelinePlaying) stopTimelinePlayback(false);
+    const soundIds = new Set(recordedSounds.map(sound => sound.id));
+    setRecordedSounds([]);
+    setTimelineClips(prev => prev.filter(clip => !soundIds.has(clip.soundId)));
+    setSelectedTimelineClipId(null);
+  };
+
   const renderTimelinePage = () => (
     <main className="min-h-0 flex-1 grid grid-cols-[260px_minmax(0,1fr)] gap-0 overflow-hidden">
       <aside className={cn("border-r p-4 flex flex-col gap-4 overflow-hidden", isDayMode ? "border-slate-900/10 bg-white/75" : "border-white/5 bg-black/35")}>
         <div className="flex items-center justify-between">
           <h2 className={cn("text-[10px] font-bold uppercase tracking-[0.22em]", mutedTextClass)}>素材库</h2>
-          <span className={cn("rounded px-2 py-1 text-[9px] font-bold", isDayMode ? "bg-slate-900/5 text-slate-500" : "bg-white/5 text-zinc-500")}>{recordedSounds.length}</span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={clearRecordedSounds}
+              disabled={recordedSounds.length === 0}
+              aria-label="Clear all recorded materials"
+              title="清空全部素材"
+              className={cn(
+                "flex h-7 w-7 items-center justify-center rounded-lg border transition-colors",
+                recordedSounds.length === 0
+                  ? isDayMode ? "border-slate-900/5 bg-slate-900/5 text-slate-300 cursor-not-allowed" : "border-white/5 bg-white/5 text-zinc-700 cursor-not-allowed"
+                  : isDayMode ? "border-slate-900/10 bg-slate-900/5 text-slate-500 hover:bg-red-50 hover:text-red-600" : "border-white/5 bg-white/5 text-zinc-500 hover:bg-red-500/15 hover:text-red-300"
+              )}
+            >
+              <Trash2 size={13} strokeWidth={2.4} />
+            </button>
+            <span className={cn("rounded px-2 py-1 text-[9px] font-bold", isDayMode ? "bg-slate-900/5 text-slate-500" : "bg-white/5 text-zinc-500")}>{recordedSounds.length}</span>
+          </div>
         </div>
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1 scrollbar-none">
           {recordedSounds.length === 0 && (
@@ -2152,11 +2307,29 @@ export default function App() {
               key={sound.id}
               draggable
               onDragStart={(e) => handleDragStart(e, sound)}
-              className={cn("rounded-lg border p-3 cursor-grab active:cursor-grabbing", isDayMode ? "bg-white border-slate-900/10 shadow-sm" : "bg-zinc-900/80 border-white/10")}
+              className={cn("relative rounded-lg border p-3 cursor-grab active:cursor-grabbing", isDayMode ? "bg-white border-slate-900/10 shadow-sm" : "bg-zinc-900/80 border-white/10")}
             >
               <div className="mb-3 flex items-center justify-between gap-2">
                 <span className={cn("truncate text-[11px] font-bold uppercase tracking-widest", isDayMode ? "text-slate-800" : "text-zinc-100")}>{sound.name}</span>
-                <span className={cn("h-2 w-2 rounded-full", sound.color || CLIP_COLOR_CLASSES[index % CLIP_COLOR_CLASSES.length])}></span>
+                <div className="flex items-center gap-1.5">
+                  <span className={cn("h-2 w-2 rounded-full", sound.color || CLIP_COLOR_CLASSES[index % CLIP_COLOR_CLASSES.length])}></span>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteRecordedSound(sound.id);
+                    }}
+                    onDragStart={(e) => e.preventDefault()}
+                    aria-label={`Delete ${sound.name}`}
+                    title="删除素材"
+                    className={cn(
+                      "flex h-6 w-6 items-center justify-center rounded-full transition-colors",
+                      isDayMode ? "text-slate-400 hover:bg-slate-900/10 hover:text-red-600" : "text-zinc-500 hover:bg-white/10 hover:text-red-300"
+                    )}
+                  >
+                    <X size={13} strokeWidth={2.8} />
+                  </button>
+                </div>
               </div>
               <div className="flex h-8 items-end gap-1">
                 {[0.32, 0.68, 0.46, 0.88, 0.58, 0.76, 0.38, 0.66].map((height, i) => (
@@ -2442,53 +2615,68 @@ export default function App() {
   // Recording & Upload Logic
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      const mimeType = getInternalRecordingMimeType();
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
       audioChunksRef.current = [];
 
-      recorder.ondataavailable = (e) => audioChunksRef.current.push(e.data);
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
 
       recorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
+        const audioBlob = new Blob(audioChunksRef.current, { type: recorder.mimeType || mimeType || 'audio/webm' });
+        audioChunksRef.current = [];
+        mediaRecorderRef.current = null;
+        setIsRecording(false);
+        stream.getTracks().forEach(track => track.stop());
+        if (!audioBlob.size) return;
+
         const arrayBuffer = await audioBlob.arrayBuffer();
         
         engineManager.init();
         if (engineManager.ctx) {
           try {
-            const rawBuffer = await engineManager.ctx.decodeAudioData(arrayBuffer);
-            const processedBuffer = await engineManager.processBuffer(rawBuffer);
+            const micBuffer = await engineManager.ctx.decodeAudioData(arrayBuffer);
             
             const newSound: SoundDef = {
               id: `rec-${Date.now()}`,
-              name: `Voice Rec ${recordedSounds.filter(s => s.id.startsWith('rec-')).length + 1}`,
+              name: `Mic Voice ${recordedSounds.filter(s => s.id.startsWith('rec-')).length + 1}`,
               category: 'custom',
               color: 'bg-pink-500',
-              pattern: [], // Empty pattern for buffer mode
-              buffer: processedBuffer,
+              pattern: [{ note: 1 }, ...new Array(15).fill({})],
+              buffer: micBuffer,
               loopMode: 'full',
-              playMode: 'buffer' // Use buffer mode for direct audio playback
+              playMode: 'buffer'
             };
             setRecordedSounds(prev => [...prev, newSound]);
+            setViewMode('timeline');
           } catch (err) {
             console.error('Recording process error:', err);
+            alert('麦克风录音生成失败，请再试一次。');
           }
         }
-        
-        stream.getTracks().forEach(track => track.stop());
       };
 
       recorder.start();
       setIsRecording(true);
     } catch (err) {
       console.error('Error starting recording:', err);
+      alert('无法启动麦克风录音，请检查浏览器麦克风权限。');
     }
   };
 
   const stopRecording = () => {
     if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.requestData();
       mediaRecorderRef.current.stop();
-      setIsRecording(false);
     }
   };
 
@@ -2950,6 +3138,20 @@ export default function App() {
     : "bg-white/5 hover:bg-white/10 text-zinc-300 border-white/5";
   const mutedTextClass = isDayMode ? "text-slate-500" : "text-zinc-500";
   const hairlineClass = isDayMode ? "bg-slate-200" : "bg-zinc-800";
+  const globalRecordLabel = globalRecordingState === 'waiting'
+    ? 'Wait BPM'
+    : globalRecordingState === 'recording'
+      ? 'Recording'
+      : globalRecordingState === 'stopping'
+        ? 'Closing'
+        : 'Arrange Rec';
+  const globalRecordTitle = globalRecordingState === 'waiting'
+    ? 'Waiting for the next global BPM loop start. Click again to cancel.'
+    : globalRecordingState === 'recording'
+      ? 'Click to stop at the next global BPM loop start'
+      : globalRecordingState === 'stopping'
+        ? 'Waiting for the next global BPM loop start to finish recording'
+        : 'Click to start recording at the next global BPM loop start';
 
   const renderLibraryCategory = (cat: { id: string; name: string }) => {
     const staticItems = AVAILABLE_SOUNDS.filter(s => s.category === cat.id);
@@ -3129,19 +3331,26 @@ export default function App() {
 
         <div className="flex shrink-0 items-center gap-2 pb-3">
           <button
-             onClick={toggleGlobalRecording}
-             aria-label={isGlobalRecording ? 'Stop global arrangement recording' : 'Start global arrangement recording'}
-             title={isGlobalRecording ? 'Stop global arrangement recording' : 'Start global arrangement recording'}
+             onClick={handleGlobalRecordingToggle}
+             aria-label={globalRecordTitle}
+             title={globalRecordTitle}
              className={cn(
                "h-10 rounded-full border px-3 sm:px-4 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest transition-all shadow-sm",
-               isGlobalRecording
+               globalRecordingState === 'recording'
                  ? "bg-red-500 text-white border-red-400 animate-pulse shadow-[0_0_24px_rgba(239,68,68,0.28)]"
-                 : isDayMode ? "bg-slate-900 text-white border-slate-900 hover:bg-slate-700" : "bg-white text-zinc-950 border-white hover:bg-zinc-200"
+                 : globalRecordingState === 'waiting'
+                   ? "bg-zinc-600 text-zinc-200 border-zinc-500 cursor-wait"
+                   : globalRecordingState === 'stopping'
+                     ? "bg-zinc-800 text-red-200 border-red-500/40 cursor-wait"
+                     : isDayMode ? "bg-slate-900 text-white border-slate-900 hover:bg-slate-700" : "bg-white text-zinc-950 border-white hover:bg-zinc-200"
              )}
           >
-             <Circle className={cn("w-3.5 h-3.5", isGlobalRecording ? "fill-white" : "fill-red-500 text-red-500")} />
-             <span className="hidden sm:inline">{isGlobalRecording ? `Recording ${arrangementEvents.length}` : 'Arrange Rec'}</span>
-             <span className="sm:hidden">{isGlobalRecording ? arrangementEvents.length : 'Rec'}</span>
+             <Circle className={cn(
+               "w-3.5 h-3.5",
+               globalRecordingState === 'recording' ? "fill-white text-white" : globalRecordingState === 'waiting' ? "fill-zinc-300 text-zinc-300" : "fill-red-500 text-red-500"
+             )} />
+             <span className="hidden sm:inline">{globalRecordLabel}</span>
+             <span className="sm:hidden">{globalRecordingState === 'recording' ? arrangementEvents.length : globalRecordLabel}</span>
           </button>
           <button
              onClick={() => setViewMode(prev => prev === 'timeline' ? 'matrix' : 'timeline')}
