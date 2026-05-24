@@ -112,40 +112,31 @@ interface StylePreset {
 
 type ColorMode = 'night' | 'day';
 type AudioTransportState = 'stopped' | 'playing' | 'paused';
-type ArrangementFilePermissionMode = 'read' | 'readwrite';
 
-interface ArrangementFileWritable {
+// File System API 类型定义
+interface FileSystemFileHandle {
+  name: string;
+  createWritable: () => Promise<FileSystemWritableFileStream>;
+  queryPermission?: (descriptor?: { mode?: 'read' | 'readwrite' }) => Promise<PermissionState>;
+  requestPermission?: (descriptor?: { mode?: 'read' | 'readwrite' }) => Promise<PermissionState>;
+}
+
+interface FileSystemWritableFileStream {
   write: (data: Blob | BufferSource | string) => Promise<void>;
   close: () => Promise<void>;
 }
 
-interface ArrangementFileHandle {
-  name: string;
-  createWritable: () => Promise<ArrangementFileWritable>;
-  queryPermission?: (descriptor?: { mode?: ArrangementFilePermissionMode }) => Promise<PermissionState>;
-  requestPermission?: (descriptor?: { mode?: ArrangementFilePermissionMode }) => Promise<PermissionState>;
-}
-
-interface ArrangementSaveFilePickerOptions {
-  suggestedName?: string;
-  types?: Array<{
-    description: string;
-    accept: Record<string, string[]>;
-  }>;
-}
-
-interface ArrangementExportTarget {
+interface ExportTargetMetadata {
   fileName: string;
   savedAt: number;
   mode: 'file-handle' | 'download';
 }
 
-interface ArrangementExportTargetRecord extends ArrangementExportTarget {
-  handle: ArrangementFileHandle;
-}
-
-interface WindowWithArrangementFilePicker extends Window {
-  showSaveFilePicker?: (options?: ArrangementSaveFilePickerOptions) => Promise<ArrangementFileHandle>;
+interface WindowWithShowSaveFilePicker extends Window {
+  showSaveFilePicker?: (options?: {
+    suggestedName?: string;
+    types?: Array<{ description: string; accept: Record<string, string[]> }>;
+  }) => Promise<FileSystemFileHandle>;
 }
 
 type MixerAudioTelemetry = AudioFrameMessage & {
@@ -165,9 +156,7 @@ type MixerAudioTelemetry = AudioFrameMessage & {
 const clampUnit = (value: number) => Math.max(0, Math.min(1, value));
 const average = (values: number[]) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
 const MUSICARR_FILE_MIME = 'application/json';
-const EXPORT_TARGET_DB_NAME = 'musicarr-export-target';
-const EXPORT_TARGET_STORE = 'targets';
-const EXPORT_TARGET_KEY = 'last-export';
+const EXPORT_TARGET_STORAGE_KEY = 'musicarr-export-target';
 const BAND_SHAPE = [0.22, 0.45, 0.74, 1, 0.74, 0.45, 0.22];
 const CATEGORY_BAND_CENTERS: Record<string, number> = {
   beat: 1,
@@ -750,60 +739,21 @@ const hydrateSavedTabs = (): { tabs: TabData[]; styleId: string } | null => {
   }
 };
 
-const openExportTargetDb = () => new Promise<IDBDatabase | null>((resolve) => {
-  if (typeof indexedDB === 'undefined') {
-    resolve(null);
-    return;
+const loadExportTargetMetadata = (): ExportTargetMetadata | null => {
+  try {
+    const stored = localStorage.getItem(EXPORT_TARGET_STORAGE_KEY);
+    return stored ? JSON.parse(stored) : null;
+  } catch {
+    return null;
   }
-
-  const request = indexedDB.open(EXPORT_TARGET_DB_NAME, 1);
-  request.onupgradeneeded = () => {
-    const db = request.result;
-    if (!db.objectStoreNames.contains(EXPORT_TARGET_STORE)) {
-      db.createObjectStore(EXPORT_TARGET_STORE);
-    }
-  };
-  request.onsuccess = () => resolve(request.result);
-  request.onerror = () => resolve(null);
-  request.onblocked = () => resolve(null);
-});
-
-const loadStoredExportTarget = async (): Promise<ArrangementExportTargetRecord | null> => {
-  const db = await openExportTargetDb();
-  if (!db) return null;
-
-  return new Promise((resolve) => {
-    const tx = db.transaction(EXPORT_TARGET_STORE, 'readonly');
-    const request = tx.objectStore(EXPORT_TARGET_STORE).get(EXPORT_TARGET_KEY);
-    request.onsuccess = () => {
-      const record = request.result as ArrangementExportTargetRecord | undefined;
-      resolve(record?.handle ? record : null);
-    };
-    request.onerror = () => resolve(null);
-    tx.oncomplete = () => db.close();
-    tx.onerror = () => {
-      db.close();
-      resolve(null);
-    };
-  });
 };
 
-const storeExportTarget = async (record: ArrangementExportTargetRecord) => {
-  const db = await openExportTargetDb();
-  if (!db) return;
-
-  await new Promise<void>((resolve) => {
-    const tx = db.transaction(EXPORT_TARGET_STORE, 'readwrite');
-    tx.objectStore(EXPORT_TARGET_STORE).put(record, EXPORT_TARGET_KEY);
-    tx.oncomplete = () => {
-      db.close();
-      resolve();
-    };
-    tx.onerror = () => {
-      db.close();
-      resolve();
-    };
-  });
+const storeExportTargetMetadata = (metadata: ExportTargetMetadata) => {
+  try {
+    localStorage.setItem(EXPORT_TARGET_STORAGE_KEY, JSON.stringify(metadata));
+  } catch {
+    // 静默失败 (存储空间满等情况)
+  }
 };
 
 const sanitizeMusicarrFileName = (fileName: string) => {
@@ -861,8 +811,8 @@ export default function App() {
   const audioChunksRef = useRef<Blob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const importFileInputRef = useRef<HTMLInputElement>(null);
-  const exportFileHandleRef = useRef<ArrangementFileHandle | null>(null);
-  const [exportTarget, setExportTarget] = useState<ArrangementExportTarget | null>(null);
+  const exportFileHandleRef = useRef<FileSystemFileHandle | null>(null);
+  const [exportTarget, setExportTarget] = useState<ExportTargetMetadata | null>(null);
   const [isExportingArrangement, setIsExportingArrangement] = useState(false);
   const [isSavingArrangementFile, setIsSavingArrangementFile] = useState(false);
   const globalRecordStartedAtRef = useRef<number>(0);
@@ -975,17 +925,10 @@ export default function App() {
   }, [tabs, selectedStyleId]);
 
   useEffect(() => {
-    let cancelled = false;
-
-    loadStoredExportTarget().then((record) => {
-      if (cancelled || !record) return;
-      exportFileHandleRef.current = record.handle;
-      setExportTarget({ fileName: record.fileName, savedAt: record.savedAt, mode: 'file-handle' });
-    });
-
-    return () => {
-      cancelled = true;
-    };
+    const metadata = loadExportTargetMetadata();
+    if (metadata) {
+      setExportTarget(metadata);
+    }
   }, []);
 
   useEffect(() => {
@@ -1878,37 +1821,32 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const ensureArrangementFilePermission = async (handle: ArrangementFileHandle) => {
-    if (!handle.queryPermission || !handle.requestPermission) return true;
-
-    const descriptor = { mode: 'readwrite' as ArrangementFilePermissionMode };
-    const currentPermission = await handle.queryPermission(descriptor);
-    if (currentPermission === 'granted') return true;
-    const nextPermission = await handle.requestPermission(descriptor);
+  const ensureFilePermission = async (handle: FileSystemFileHandle): Promise<boolean> => {
+    if (!handle.queryPermission) return true;
+    const permission = await handle.queryPermission({ mode: 'readwrite' });
+    if (permission === 'granted') return true;
+    if (!handle.requestPermission) return false;
+    const nextPermission = await handle.requestPermission({ mode: 'readwrite' });
     return nextPermission === 'granted';
   };
 
-  const writeArrangementFile = async (handle: ArrangementFileHandle, text: string) => {
-    const hasPermission = await ensureArrangementFilePermission(handle);
-    if (!hasPermission) throw new Error('file-permission-denied');
-
+  const writeToFileHandle = async (handle: FileSystemFileHandle, text: string) => {
+    if (!await ensureFilePermission(handle)) throw new Error('Permission denied');
     const writable = await handle.createWritable();
     await writable.write(new Blob([text], { type: MUSICARR_FILE_MIME }));
     await writable.close();
   };
 
-  const rememberExportTarget = async (handle: ArrangementFileHandle) => {
-    const target = {
+  const rememberExportTarget = (handle: FileSystemFileHandle) => {
+    const metadata: ExportTargetMetadata = {
       fileName: handle.name,
       savedAt: Date.now(),
-      mode: 'file-handle' as const,
+      mode: 'file-handle',
     };
     exportFileHandleRef.current = handle;
-    setExportTarget(target);
-    await storeExportTarget({ ...target, handle });
+    setExportTarget(metadata);
+    storeExportTargetMetadata(metadata);
   };
-
-  const isPickerAbort = (err: unknown) => err instanceof DOMException && err.name === 'AbortError';
 
   const handleExportArrangement = async () => {
     if (isExportingArrangement) return;
@@ -1917,33 +1855,29 @@ export default function App() {
     try {
       const text = await createMusicarrText();
       const suggestedName = createSuggestedExportFileName();
-      const saveFilePicker = (window as WindowWithArrangementFilePicker).showSaveFilePicker;
+      const saveFilePicker = (window as WindowWithShowSaveFilePicker).showSaveFilePicker;
 
       if (saveFilePicker) {
-        const handle = await saveFilePicker({
-          suggestedName,
-          types: [
-            {
-              description: 'Music Arrangement',
-              accept: {
-                [MUSICARR_FILE_MIME]: ['.musicarr'],
-              },
-            },
-          ],
-        });
-        await writeArrangementFile(handle, text);
-        await rememberExportTarget(handle);
-        return;
+        try {
+          const handle = await saveFilePicker({
+            suggestedName,
+            types: [{ description: 'Music Arrangement', accept: { [MUSICARR_FILE_MIME]: ['.musicarr'] } }],
+          });
+          await writeToFileHandle(handle, text);
+          rememberExportTarget(handle);
+          return;
+        } catch (err) {
+          if ((err as DOMException)?.name === 'AbortError') return;
+        }
       }
 
       const fallbackName = window.prompt('请输入导出文件名', suggestedName);
       if (!fallbackName) return;
       const fileName = sanitizeMusicarrFileName(fallbackName);
       downloadMusicarrFile(text, fileName);
-      exportFileHandleRef.current = null;
+      storeExportTargetMetadata({ fileName, savedAt: Date.now(), mode: 'download' });
       setExportTarget({ fileName, savedAt: Date.now(), mode: 'download' });
     } catch (err) {
-      if (isPickerAbort(err)) return;
       console.error('Export failed', err);
       alert('导出失败，请重试。');
     } finally {
@@ -1959,16 +1893,17 @@ export default function App() {
     try {
       const text = await createMusicarrText();
       if (handle) {
-        await writeArrangementFile(handle, text);
-        await rememberExportTarget(handle);
+        await writeToFileHandle(handle, text);
+        rememberExportTarget(handle);
       } else {
         downloadMusicarrFile(text, exportTarget.fileName);
-        setExportTarget({ ...exportTarget, savedAt: Date.now() });
+        const updated = { ...exportTarget, savedAt: Date.now() };
+        storeExportTargetMetadata(updated);
+        setExportTarget(updated);
       }
     } catch (err) {
-      if (isPickerAbort(err)) return;
       console.error('Save failed', err);
-      alert('保存失败，请确认浏览器文件权限，或点击 Export 重新选择保存位置。');
+      alert('保存失败，请确认文件权限。');
     } finally {
       setIsSavingArrangementFile(false);
     }
