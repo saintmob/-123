@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus, RotateCcw, Shuffle, Keyboard, Circle, Wand2, Sun, Moon, Trash2, Radio, ListMusic, Scissors, Copy, MoveHorizontal, SkipBack, SkipForward, Pause, Save } from 'lucide-react';
+import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus, RotateCcw, Shuffle, Keyboard, Circle, Wand2, Sun, Moon, Trash2, Radio, ListMusic, Scissors, Copy, MoveHorizontal, SkipBack, SkipForward, Pause } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { AUDIO_STYLES, AVAILABLE_SOUNDS, AudioStyleId, SoundDef, engineManager, FxParams, defaultFx, KEYBOARD_NOTES } from './audio';
 import { cn } from './lib/utils';
@@ -113,30 +113,44 @@ interface StylePreset {
 type ColorMode = 'night' | 'day';
 type AudioTransportState = 'stopped' | 'playing' | 'paused';
 
-// File System API 类型定义
-interface FileSystemFileHandle {
+interface SerializableSoundDef extends Omit<SoundDef, 'buffer'> {
+  bufferBase64?: string;
+  sampleRate?: number;
+  numberOfChannels?: number;
+}
+
+interface SerializedTabData {
+  id: string;
   name: string;
-  createWritable: () => Promise<FileSystemWritableFileStream>;
-  queryPermission?: (descriptor?: { mode?: 'read' | 'readwrite' }) => Promise<PermissionState>;
-  requestPermission?: (descriptor?: { mode?: 'read' | 'readwrite' }) => Promise<PermissionState>;
+  slots: (SerializableSoundDef | null)[];
+  mutedSlots: boolean[];
+  moduleFx: FxParams[];
+  masterFx: FxParams;
+  styleId: AudioStyleId;
+  activeStep: number;
+  isPlaying: boolean;
+  fxSlots?: FxParams[];
 }
 
-interface FileSystemWritableFileStream {
-  write: (data: Blob | BufferSource | string) => Promise<void>;
-  close: () => Promise<void>;
-}
-
-interface ExportTargetMetadata {
-  fileName: string;
-  savedAt: number;
-  mode: 'file-handle' | 'download';
-}
-
-interface WindowWithShowSaveFilePicker extends Window {
-  showSaveFilePicker?: (options?: {
-    suggestedName?: string;
-    types?: Array<{ description: string; accept: Record<string, string[]> }>;
-  }) => Promise<FileSystemFileHandle>;
+interface MusicArrFile {
+  version: '1.0';
+  tabs: SerializedTabData[];
+  recordedSounds: SerializableSoundDef[];
+  timeline?: {
+    duration: number;
+    playhead: number;
+    loopRange: {
+      start: number;
+      end: number;
+    };
+    clips: TimelineClip[];
+    selectedClipId?: string | null;
+  };
+  userSettings: {
+    activeTabId: string;
+    keyboardInstrumentMode: string;
+    isKeyboardVisible?: boolean;
+  };
 }
 
 type MixerAudioTelemetry = AudioFrameMessage & {
@@ -156,7 +170,9 @@ type MixerAudioTelemetry = AudioFrameMessage & {
 const clampUnit = (value: number) => Math.max(0, Math.min(1, value));
 const average = (values: number[]) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
 const MUSICARR_FILE_MIME = 'application/json';
-const EXPORT_TARGET_STORAGE_KEY = 'musicarr-export-target';
+const AUTOSAVE_DB_NAME = 'musicarr-workbench';
+const AUTOSAVE_STORE = 'projects';
+const AUTOSAVE_KEY = 'current-project';
 const BAND_SHAPE = [0.22, 0.45, 0.74, 1, 0.74, 0.45, 0.22];
 const CATEGORY_BAND_CENTERS: Record<string, number> = {
   beat: 1,
@@ -541,7 +557,7 @@ const buildMixerTelemetry = (
 ): MixerAudioTelemetry => {
   const masterLevel = clampUnit((tab.masterFx.volume ?? 0) / 100);
   const slotLevels = tab.fxSlots.map((fx, index) => (tab.mutedSlots[index] ? 0 : clampUnit((fx?.volume ?? 0) / 100)));
-  const slotActivity = tab.slots.map((slot) => (tab.isPlaying ? (hasStepHit(slot, tab.activeStep) ? 1 : 0) : 0));
+  const slotActivity: number[] = tab.slots.map((slot) => (tab.isPlaying ? (hasStepHit(slot, tab.activeStep) ? 1 : 0) : 0));
   const activeSlotCount = tab.slots.filter(Boolean).length;
   const activeHits = slotActivity.reduce((sum, value) => sum + value, 0);
   const slotMean = average(slotLevels);
@@ -739,21 +755,57 @@ const hydrateSavedTabs = (): { tabs: TabData[]; styleId: string } | null => {
   }
 };
 
-const loadExportTargetMetadata = (): ExportTargetMetadata | null => {
-  try {
-    const stored = localStorage.getItem(EXPORT_TARGET_STORAGE_KEY);
-    return stored ? JSON.parse(stored) : null;
-  } catch {
-    return null;
+const openAutosaveDb = () => new Promise<IDBDatabase | null>((resolve) => {
+  if (typeof indexedDB === 'undefined') {
+    resolve(null);
+    return;
   }
+
+  const request = indexedDB.open(AUTOSAVE_DB_NAME, 1);
+  request.onupgradeneeded = () => {
+    const db = request.result;
+    if (!db.objectStoreNames.contains(AUTOSAVE_STORE)) {
+      db.createObjectStore(AUTOSAVE_STORE);
+    }
+  };
+  request.onsuccess = () => resolve(request.result);
+  request.onerror = () => resolve(null);
+  request.onblocked = () => resolve(null);
+});
+
+const loadAutosavedArrangement = async (): Promise<MusicArrFile | null> => {
+  const db = await openAutosaveDb();
+  if (!db) return null;
+
+  return new Promise((resolve) => {
+    const tx = db.transaction(AUTOSAVE_STORE, 'readonly');
+    const request = tx.objectStore(AUTOSAVE_STORE).get(AUTOSAVE_KEY);
+    request.onsuccess = () => resolve((request.result as MusicArrFile | undefined) ?? null);
+    request.onerror = () => resolve(null);
+    tx.oncomplete = () => db.close();
+    tx.onerror = () => {
+      db.close();
+      resolve(null);
+    };
+  });
 };
 
-const storeExportTargetMetadata = (metadata: ExportTargetMetadata) => {
-  try {
-    localStorage.setItem(EXPORT_TARGET_STORAGE_KEY, JSON.stringify(metadata));
-  } catch {
-    // 静默失败 (存储空间满等情况)
-  }
+const storeAutosavedArrangement = async (payload: MusicArrFile) => {
+  const db = await openAutosaveDb();
+  if (!db) return;
+
+  await new Promise<void>((resolve) => {
+    const tx = db.transaction(AUTOSAVE_STORE, 'readwrite');
+    tx.objectStore(AUTOSAVE_STORE).put(payload, AUTOSAVE_KEY);
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      db.close();
+      resolve();
+    };
+  });
 };
 
 const sanitizeMusicarrFileName = (fileName: string) => {
@@ -797,10 +849,10 @@ export default function App() {
   });
 
   const [hoveredFxSlot, setHoveredFxSlot] = useState<number | null>(null);
-  const fxTimeoutRef = useRef<NodeJS.Timeout>();
+  const fxTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [hoveredTabFxId, setHoveredTabFxId] = useState<string | null>(null);
-  const tabFxTimeoutRef = useRef<NodeJS.Timeout>();
+  const tabFxTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Recording & Upload states
   const [isRecording, setIsRecording] = useState(false);
@@ -811,10 +863,10 @@ export default function App() {
   const audioChunksRef = useRef<Blob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const importFileInputRef = useRef<HTMLInputElement>(null);
-  const exportFileHandleRef = useRef<FileSystemFileHandle | null>(null);
-  const [exportTarget, setExportTarget] = useState<ExportTargetMetadata | null>(null);
   const [isExportingArrangement, setIsExportingArrangement] = useState(false);
-  const [isSavingArrangementFile, setIsSavingArrangementFile] = useState(false);
+  const autosaveHydratedRef = useRef(false);
+  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autosaveSeqRef = useRef(0);
   const globalRecordStartedAtRef = useRef<number>(0);
   const globalRecorderRef = useRef<MediaRecorder | null>(null);
   const globalRecordChunksRef = useRef<Blob[]>([]);
@@ -923,13 +975,6 @@ export default function App() {
   useEffect(() => {
     setSaveStatus('idle');
   }, [tabs, selectedStyleId]);
-
-  useEffect(() => {
-    const metadata = loadExportTargetMetadata();
-    if (metadata) {
-      setExportTarget(metadata);
-    }
-  }, []);
 
   useEffect(() => {
     window.localStorage.setItem(COLOR_MODE_STORAGE_KEY, colorMode);
@@ -1174,8 +1219,8 @@ export default function App() {
 
   const handleModuleMouseEnter = (index: number) => {
     if (activeTab.slots[index]) {
-      clearTimeout(fxTimeoutRef.current);
-      clearTimeout(tabFxTimeoutRef.current);
+      if (fxTimeoutRef.current) clearTimeout(fxTimeoutRef.current);
+      if (tabFxTimeoutRef.current) clearTimeout(tabFxTimeoutRef.current);
       setHoveredTabFxId(null);
       setHoveredFxSlot(index);
     }
@@ -1186,8 +1231,8 @@ export default function App() {
   };
 
   const handleTabMouseEnter = (id: string) => {
-    clearTimeout(tabFxTimeoutRef.current);
-    clearTimeout(fxTimeoutRef.current);
+    if (tabFxTimeoutRef.current) clearTimeout(tabFxTimeoutRef.current);
+    if (fxTimeoutRef.current) clearTimeout(fxTimeoutRef.current);
     setHoveredFxSlot(null);
     setHoveredTabFxId(id);
   };
@@ -1622,46 +1667,6 @@ export default function App() {
     };
   }, []);
 
-  interface SerializableSoundDef extends Omit<SoundDef, 'buffer'> {
-    bufferBase64?: string;
-    sampleRate?: number;
-    numberOfChannels?: number;
-  }
-
-  interface SerializedTabData {
-    id: string;
-    name: string;
-    slots: (SerializableSoundDef | null)[];
-    mutedSlots: boolean[];
-    moduleFx: FxParams[];
-    masterFx: FxParams;
-    styleId: AudioStyleId;
-    activeStep: number;
-    isPlaying: boolean;
-    fxSlots?: FxParams[]; // backward compatibility for older exports
-  }
-
-  interface MusicArrFile {
-    version: '1.0';
-    tabs: SerializedTabData[];
-    recordedSounds: SerializableSoundDef[];
-    timeline?: {
-      duration: number;
-      playhead: number;
-      loopRange: {
-        start: number;
-        end: number;
-      };
-      clips: TimelineClip[];
-      selectedClipId?: string | null;
-    };
-    userSettings: {
-      activeTabId: string;
-      keyboardInstrumentMode: string;
-      isKeyboardVisible?: boolean;
-    };
-  }
-
   const encodeAudioBufferToWavBase64 = (buffer: AudioBuffer): string => {
     const numChannels = buffer.numberOfChannels;
     const sampleRate = buffer.sampleRate;
@@ -1776,8 +1781,8 @@ export default function App() {
       moduleFx: tab.fxSlots,
       masterFx: tab.masterFx,
       styleId: tab.styleId,
-      activeStep: tab.activeStep,
-      isPlaying: tab.isPlaying,
+      activeStep: 0,
+      isPlaying: false,
     })));
 
     const recordedPayload = await Promise.all(recordedSounds.map(serializeSoundDef));
@@ -1821,33 +1826,6 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const ensureFilePermission = async (handle: FileSystemFileHandle): Promise<boolean> => {
-    if (!handle.queryPermission) return true;
-    const permission = await handle.queryPermission({ mode: 'readwrite' });
-    if (permission === 'granted') return true;
-    if (!handle.requestPermission) return false;
-    const nextPermission = await handle.requestPermission({ mode: 'readwrite' });
-    return nextPermission === 'granted';
-  };
-
-  const writeToFileHandle = async (handle: FileSystemFileHandle, text: string) => {
-    if (!await ensureFilePermission(handle)) throw new Error('Permission denied');
-    const writable = await handle.createWritable();
-    await writable.write(new Blob([text], { type: MUSICARR_FILE_MIME }));
-    await writable.close();
-  };
-
-  const rememberExportTarget = (handle: FileSystemFileHandle) => {
-    const metadata: ExportTargetMetadata = {
-      fileName: handle.name,
-      savedAt: Date.now(),
-      mode: 'file-handle',
-    };
-    exportFileHandleRef.current = handle;
-    setExportTarget(metadata);
-    storeExportTargetMetadata(metadata);
-  };
-
   const handleExportArrangement = async () => {
     if (isExportingArrangement) return;
     setIsExportingArrangement(true);
@@ -1855,28 +1833,10 @@ export default function App() {
     try {
       const text = await createMusicarrText();
       const suggestedName = createSuggestedExportFileName();
-      const saveFilePicker = (window as WindowWithShowSaveFilePicker).showSaveFilePicker;
-
-      if (saveFilePicker) {
-        try {
-          const handle = await saveFilePicker({
-            suggestedName,
-            types: [{ description: 'Music Arrangement', accept: { [MUSICARR_FILE_MIME]: ['.musicarr'] } }],
-          });
-          await writeToFileHandle(handle, text);
-          rememberExportTarget(handle);
-          return;
-        } catch (err) {
-          if ((err as DOMException)?.name === 'AbortError') return;
-        }
-      }
-
       const fallbackName = window.prompt('请输入导出文件名', suggestedName);
       if (!fallbackName) return;
       const fileName = sanitizeMusicarrFileName(fallbackName);
       downloadMusicarrFile(text, fileName);
-      storeExportTargetMetadata({ fileName, savedAt: Date.now(), mode: 'download' });
-      setExportTarget({ fileName, savedAt: Date.now(), mode: 'download' });
     } catch (err) {
       console.error('Export failed', err);
       alert('导出失败，请重试。');
@@ -1885,28 +1845,63 @@ export default function App() {
     }
   };
 
-  const handleSaveArrangementFile = async () => {
-    if (!exportTarget || isSavingArrangementFile || isExportingArrangement) return;
-    const handle = exportFileHandleRef.current;
-
-    setIsSavingArrangementFile(true);
-    try {
-      const text = await createMusicarrText();
-      if (handle) {
-        await writeToFileHandle(handle, text);
-        rememberExportTarget(handle);
-      } else {
-        downloadMusicarrFile(text, exportTarget.fileName);
-        const updated = { ...exportTarget, savedAt: Date.now() };
-        storeExportTargetMetadata(updated);
-        setExportTarget(updated);
-      }
-    } catch (err) {
-      console.error('Save failed', err);
-      alert('保存失败，请确认文件权限。');
-    } finally {
-      setIsSavingArrangementFile(false);
+  const applyArrangementFile = async (data: MusicArrFile) => {
+    if (!data || !Array.isArray(data.tabs)) {
+      throw new Error('无效的文件格式');
     }
+
+    engineManager.init();
+    engineManager.stopAllProjects();
+    setPendingPlayIds(new Set());
+    const importedRecordedSounds = await Promise.all((data.recordedSounds || []).map(deserializeSoundDef));
+    const importedTabs = await Promise.all(data.tabs.map(async (tab) => ({
+      ...tab,
+      slots: await Promise.all(tab.slots.map((slot) => slot ? deserializeSoundDef(slot) : null)),
+      fxSlots: tab.moduleFx ?? tab.fxSlots ?? new Array(7).fill(null).map(defaultFx),
+      isPlaying: false,
+      activeStep: 0,
+    })));
+
+    setRecordedSounds(importedRecordedSounds);
+    setTabs(importedTabs);
+    setActiveTabId(data.userSettings?.activeTabId || importedTabs[0]?.id || 'tab-1');
+    setKeyboardInstrumentMode(data.userSettings?.keyboardInstrumentMode || KEYBOARD_INSTRUMENT_MODES[0].id);
+    setIsKeyboardVisible(Boolean(data.userSettings?.isKeyboardVisible));
+    if (data.timeline) {
+      const nextDuration = Math.max(1, Math.min(600, Number(data.timeline.duration) || DEFAULT_TIMELINE_SECONDS));
+      const nextLoopStart = Math.max(0, Math.min(data.timeline.loopRange?.start ?? 0, nextDuration - 0.25));
+      const nextLoopEnd = Math.max(nextLoopStart + 0.25, Math.min(data.timeline.loopRange?.end ?? Math.min(8, nextDuration), nextDuration));
+      const nextPlayhead = Math.max(0, Math.min(data.timeline.playhead ?? nextLoopStart, nextDuration));
+      const nextClips = (data.timeline.clips || []).map((clip) => {
+        const duration = Math.max(0.5, Math.min(clip.duration, nextDuration));
+        return {
+          ...clip,
+          track: Math.max(0, Math.min(TIMELINE_TRACKS - 1, clip.track)),
+          start: Math.max(0, Math.min(clip.start, Math.max(0, nextDuration - duration))),
+          duration,
+          trimStart: Math.max(0, clip.trimStart),
+        };
+      });
+      setTimelineDuration(nextDuration);
+      setTimelineLoopRange({ start: nextLoopStart, end: nextLoopEnd });
+      setTimelinePlayhead(nextPlayhead);
+      timelinePlayheadRef.current = nextPlayhead;
+      timelineOffsetRef.current = nextPlayhead;
+      setTimelineClips(nextClips);
+      setSelectedTimelineClipId(data.timeline.selectedClipId ?? null);
+    } else {
+      setTimelineClips([]);
+      setSelectedTimelineClipId(null);
+    }
+
+    importedTabs.forEach((tab) => {
+      const engine = engineManager.getProject(tab.id);
+      engine.setStyle(tab.styleId);
+      engine.setSlots(tab.slots);
+      engine.setMutedSlots(tab.mutedSlots);
+      (tab.fxSlots || tab.moduleFx || []).forEach((fx, index) => engine.setFxParams(index, fx));
+      engine.setMasterFxParams(tab.masterFx);
+    });
   };
 
   const handleImportArrangement = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -1922,62 +1917,8 @@ export default function App() {
     try {
       const text = await file.text();
       const data = JSON.parse(text) as MusicArrFile;
-      if (!data || !Array.isArray(data.tabs)) {
-        throw new Error('无效的文件格式');
-      }
-
-      engineManager.init();
-      engineManager.stopAllProjects();
-      setPendingPlayIds(new Set());
-      const importedRecordedSounds = await Promise.all((data.recordedSounds || []).map(deserializeSoundDef));
-      const importedTabs = await Promise.all(data.tabs.map(async (tab) => ({
-        ...tab,
-        slots: await Promise.all(tab.slots.map((slot) => slot ? deserializeSoundDef(slot) : null)),
-        fxSlots: tab.moduleFx ?? tab.fxSlots ?? new Array(7).fill(null).map(defaultFx),
-        isPlaying: false,
-        activeStep: 0,
-      })));
-
-      setRecordedSounds(importedRecordedSounds);
-      setTabs(importedTabs);
-      setActiveTabId(data.userSettings?.activeTabId || importedTabs[0]?.id || 'tab-1');
-      setKeyboardInstrumentMode(data.userSettings?.keyboardInstrumentMode || KEYBOARD_INSTRUMENT_MODES[0].id);
-      setIsKeyboardVisible(Boolean(data.userSettings?.isKeyboardVisible));
-      if (data.timeline) {
-        const nextDuration = Math.max(1, Math.min(600, Number(data.timeline.duration) || DEFAULT_TIMELINE_SECONDS));
-        const nextLoopStart = Math.max(0, Math.min(data.timeline.loopRange?.start ?? 0, nextDuration - 0.25));
-        const nextLoopEnd = Math.max(nextLoopStart + 0.25, Math.min(data.timeline.loopRange?.end ?? Math.min(8, nextDuration), nextDuration));
-        const nextPlayhead = Math.max(0, Math.min(data.timeline.playhead ?? nextLoopStart, nextDuration));
-        const nextClips = (data.timeline.clips || []).map((clip) => {
-          const duration = Math.max(0.5, Math.min(clip.duration, nextDuration));
-          return {
-            ...clip,
-            track: Math.max(0, Math.min(TIMELINE_TRACKS - 1, clip.track)),
-            start: Math.max(0, Math.min(clip.start, Math.max(0, nextDuration - duration))),
-            duration,
-            trimStart: Math.max(0, clip.trimStart),
-          };
-        });
-        setTimelineDuration(nextDuration);
-        setTimelineLoopRange({ start: nextLoopStart, end: nextLoopEnd });
-        setTimelinePlayhead(nextPlayhead);
-        timelinePlayheadRef.current = nextPlayhead;
-        timelineOffsetRef.current = nextPlayhead;
-        setTimelineClips(nextClips);
-        setSelectedTimelineClipId(data.timeline.selectedClipId ?? null);
-      } else {
-        setTimelineClips([]);
-        setSelectedTimelineClipId(null);
-      }
-
-      importedTabs.forEach((tab) => {
-        const engine = engineManager.getProject(tab.id);
-        engine.setStyle(tab.styleId);
-        engine.setSlots(tab.slots);
-        engine.setMutedSlots(tab.mutedSlots);
-        (tab.fxSlots || tab.moduleFx || []).forEach((fx, index) => engine.setFxParams(index, fx));
-        engine.setMasterFxParams(tab.masterFx);
-      });
+      await applyArrangementFile(data);
+      await storeAutosavedArrangement(data);
     } catch (err) {
       console.error('Import failed', err);
       alert('导入失败，请检查文件格式。');
@@ -1985,6 +1926,66 @@ export default function App() {
 
     event.target.value = '';
   };
+
+  useEffect(() => {
+    let cancelled = false;
+
+    loadAutosavedArrangement().then(async (data) => {
+      if (cancelled) return;
+      try {
+        if (data) {
+          await applyArrangementFile(data);
+          setSaveStatus('loaded');
+        }
+      } catch (err) {
+        console.error('Autosave load failed', err);
+      } finally {
+        if (!cancelled) {
+          autosaveHydratedRef.current = true;
+        }
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!autosaveHydratedRef.current) return;
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+    }
+
+    const saveSeq = autosaveSeqRef.current + 1;
+    autosaveSeqRef.current = saveSeq;
+    autosaveTimerRef.current = setTimeout(() => {
+      createMusicarrPayload()
+        .then((payload) => storeAutosavedArrangement(payload))
+        .then(() => {
+          if (autosaveSeqRef.current === saveSeq) {
+            setSaveStatus('saved');
+          }
+        })
+        .catch((err) => console.error('Autosave failed', err));
+    }, 900);
+
+    return () => {
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+      }
+    };
+  }, [
+    tabs,
+    recordedSounds,
+    timelineDuration,
+    timelineLoopRange,
+    timelineClips,
+    selectedTimelineClipId,
+    activeTabId,
+    keyboardInstrumentMode,
+    isKeyboardVisible,
+  ]);
 
   const toggleMute = (index: number) => {
     if (!activeTab.slots[index]) return;
@@ -2746,7 +2747,7 @@ export default function App() {
     e.stopPropagation();
     setRecordedSounds(prev => prev.map(s => {
       if (s.id !== id) return s;
-      const newMode = s.loopMode === 'fast' ? 'full' : 'fast';
+      const newMode: SoundDef['loopMode'] = s.loopMode === 'fast' ? 'full' : 'fast';
       return {
         ...s,
         loopMode: newMode,
@@ -2755,9 +2756,9 @@ export default function App() {
     }));
     
     // Update active slots
-    const newSlots = activeTab.slots.map(slot => {
+    const newSlots: TabData['slots'] = activeTab.slots.map(slot => {
       if (slot && slot.id === id) {
-        const newMode = slot.loopMode === 'fast' ? 'full' : 'fast';
+        const newMode: SoundDef['loopMode'] = slot.loopMode === 'fast' ? 'full' : 'fast';
         return {
           ...slot,
           loopMode: newMode,
@@ -3205,7 +3206,7 @@ export default function App() {
     if (recordedNotes.length > 0) {
       const totalDuration = Math.max(1, Date.now() - recordStartTimeRef.current);
       const stepDuration = totalDuration / 16;
-      const stepNotes = new Array<Set<number>>(16).fill(null).map(() => new Set<number>());
+      const stepNotes = Array.from({ length: 16 }, () => new Set<number>());
 
       recordedNotes.forEach(({ time, note }) => {
         const step = Math.min(15, Math.max(0, Math.floor((time - recordStartTimeRef.current) / stepDuration)));
@@ -3310,13 +3311,6 @@ export default function App() {
       : globalRecordingState === 'stopping'
         ? 'Waiting for the next global BPM loop start to finish recording'
         : 'Click to start recording at the next global BPM loop start';
-  const canSaveArrangementFile = Boolean(exportTarget) && !isSavingArrangementFile && !isExportingArrangement;
-  const saveArrangementTitle = exportTarget
-    ? exportTarget.mode === 'file-handle'
-      ? `保存到上次导出的文件：${exportTarget.fileName}`
-      : `使用上次导出文件名保存：${exportTarget.fileName}`
-    : '首次 Export 成功后可用';
-
   const renderLibraryCategory = (cat: { id: string; name: string }) => {
     const staticItems = AVAILABLE_SOUNDS.filter(s => s.category === cat.id);
     const customItems = cat.id === 'custom' ? recordedSounds : [];
@@ -3450,33 +3444,19 @@ export default function App() {
              New
           </button>
 
-	          <button
-	             onClick={handleSaveArrangementFile}
-	             disabled={!canSaveArrangementFile}
-	             aria-label={saveArrangementTitle}
-	             title={saveArrangementTitle}
-	             className={cn(
-	               "px-3 py-2 rounded-lg text-[9px] font-bold uppercase tracking-widest transition-all inline-flex items-center gap-1.5",
-	               canSaveArrangementFile
-	                 ? "bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white"
-	                 : "bg-white/[0.03] text-zinc-700 cursor-not-allowed"
-	             )}
-	          >
-	             <Save size={12} strokeWidth={2.6} />
-	             {isSavingArrangementFile ? 'Saving' : 'Save'}
-	          </button>
-	          <button
-	             onClick={handleExportArrangement}
-	             disabled={isExportingArrangement || isSavingArrangementFile}
-	             className={cn(
-	               "px-3 py-2 rounded-lg text-[9px] font-bold uppercase tracking-widest transition-all",
-	               isExportingArrangement || isSavingArrangementFile
-	                 ? "bg-white/[0.03] text-zinc-700 cursor-wait"
-	                 : "bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white"
-	             )}
-	          >
-	             {isExportingArrangement ? 'Exporting' : 'Export'}
-	          </button>
+          <button
+             onClick={handleExportArrangement}
+             disabled={isExportingArrangement}
+             title="Export arrangement"
+             className={cn(
+               "px-3 py-2 rounded-lg text-[9px] font-bold uppercase tracking-widest transition-all",
+               isExportingArrangement
+                 ? "bg-white/[0.03] text-zinc-700 cursor-wait"
+                 : "bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white"
+             )}
+          >
+             {isExportingArrangement ? 'Exporting' : 'Export'}
+          </button>
           <button
              onClick={() => importFileInputRef.current?.click()}
              className="px-3 py-2 rounded-lg bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white text-[9px] font-bold uppercase tracking-widest transition-all"
@@ -3845,7 +3825,9 @@ export default function App() {
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 10 }}
-              onMouseEnter={() => clearTimeout(fxTimeoutRef.current)}
+              onMouseEnter={() => {
+                if (fxTimeoutRef.current) clearTimeout(fxTimeoutRef.current);
+              }}
               onMouseLeave={handleModuleMouseLeave}
               className="absolute z-50 left-0 right-0 top-[50%] lg:top-[60%] mx-auto w-[95%] max-w-5xl bg-zinc-950/95 backdrop-blur-xl border border-white/10 rounded-2xl p-6 shadow-2xl flex flex-col gap-5 pointer-events-auto"
             >
@@ -3894,7 +3876,9 @@ export default function App() {
               initial={{ opacity: 0, y: -20 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
-              onMouseEnter={() => clearTimeout(tabFxTimeoutRef.current)}
+              onMouseEnter={() => {
+                if (tabFxTimeoutRef.current) clearTimeout(tabFxTimeoutRef.current);
+              }}
               onMouseLeave={handleTabMouseLeave}
               className="absolute z-50 left-0 right-0 top-16 mx-auto w-[95%] max-w-5xl bg-indigo-950/95 backdrop-blur-xl border border-indigo-500/30 rounded-b-2xl p-6 shadow-2xl flex flex-col gap-5 pointer-events-auto"
             >
