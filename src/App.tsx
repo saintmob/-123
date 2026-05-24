@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus, RotateCcw, Shuffle, Keyboard, Circle, Wand2, Sun, Moon, Trash2, Radio, ListMusic, Scissors, Copy, MoveHorizontal, SkipBack, SkipForward, Pause } from 'lucide-react';
+import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus, RotateCcw, Shuffle, Keyboard, Circle, Wand2, Sun, Moon, Trash2, Radio, ListMusic, Scissors, Copy, MoveHorizontal, SkipBack, SkipForward, Pause, Save } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { AUDIO_STYLES, AVAILABLE_SOUNDS, AudioStyleId, SoundDef, engineManager, FxParams, defaultFx, KEYBOARD_NOTES } from './audio';
 import { cn } from './lib/utils';
@@ -112,6 +112,41 @@ interface StylePreset {
 
 type ColorMode = 'night' | 'day';
 type AudioTransportState = 'stopped' | 'playing' | 'paused';
+type ArrangementFilePermissionMode = 'read' | 'readwrite';
+
+interface ArrangementFileWritable {
+  write: (data: Blob | BufferSource | string) => Promise<void>;
+  close: () => Promise<void>;
+}
+
+interface ArrangementFileHandle {
+  name: string;
+  createWritable: () => Promise<ArrangementFileWritable>;
+  queryPermission?: (descriptor?: { mode?: ArrangementFilePermissionMode }) => Promise<PermissionState>;
+  requestPermission?: (descriptor?: { mode?: ArrangementFilePermissionMode }) => Promise<PermissionState>;
+}
+
+interface ArrangementSaveFilePickerOptions {
+  suggestedName?: string;
+  types?: Array<{
+    description: string;
+    accept: Record<string, string[]>;
+  }>;
+}
+
+interface ArrangementExportTarget {
+  fileName: string;
+  savedAt: number;
+  mode: 'file-handle' | 'download';
+}
+
+interface ArrangementExportTargetRecord extends ArrangementExportTarget {
+  handle: ArrangementFileHandle;
+}
+
+interface WindowWithArrangementFilePicker extends Window {
+  showSaveFilePicker?: (options?: ArrangementSaveFilePickerOptions) => Promise<ArrangementFileHandle>;
+}
 
 type MixerAudioTelemetry = AudioFrameMessage & {
   beat: number;
@@ -129,6 +164,10 @@ type MixerAudioTelemetry = AudioFrameMessage & {
 
 const clampUnit = (value: number) => Math.max(0, Math.min(1, value));
 const average = (values: number[]) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+const MUSICARR_FILE_MIME = 'application/json';
+const EXPORT_TARGET_DB_NAME = 'musicarr-export-target';
+const EXPORT_TARGET_STORE = 'targets';
+const EXPORT_TARGET_KEY = 'last-export';
 const BAND_SHAPE = [0.22, 0.45, 0.74, 1, 0.74, 0.45, 0.22];
 const CATEGORY_BAND_CENTERS: Record<string, number> = {
   beat: 1,
@@ -711,6 +750,72 @@ const hydrateSavedTabs = (): { tabs: TabData[]; styleId: string } | null => {
   }
 };
 
+const openExportTargetDb = () => new Promise<IDBDatabase | null>((resolve) => {
+  if (typeof indexedDB === 'undefined') {
+    resolve(null);
+    return;
+  }
+
+  const request = indexedDB.open(EXPORT_TARGET_DB_NAME, 1);
+  request.onupgradeneeded = () => {
+    const db = request.result;
+    if (!db.objectStoreNames.contains(EXPORT_TARGET_STORE)) {
+      db.createObjectStore(EXPORT_TARGET_STORE);
+    }
+  };
+  request.onsuccess = () => resolve(request.result);
+  request.onerror = () => resolve(null);
+  request.onblocked = () => resolve(null);
+});
+
+const loadStoredExportTarget = async (): Promise<ArrangementExportTargetRecord | null> => {
+  const db = await openExportTargetDb();
+  if (!db) return null;
+
+  return new Promise((resolve) => {
+    const tx = db.transaction(EXPORT_TARGET_STORE, 'readonly');
+    const request = tx.objectStore(EXPORT_TARGET_STORE).get(EXPORT_TARGET_KEY);
+    request.onsuccess = () => {
+      const record = request.result as ArrangementExportTargetRecord | undefined;
+      resolve(record?.handle ? record : null);
+    };
+    request.onerror = () => resolve(null);
+    tx.oncomplete = () => db.close();
+    tx.onerror = () => {
+      db.close();
+      resolve(null);
+    };
+  });
+};
+
+const storeExportTarget = async (record: ArrangementExportTargetRecord) => {
+  const db = await openExportTargetDb();
+  if (!db) return;
+
+  await new Promise<void>((resolve) => {
+    const tx = db.transaction(EXPORT_TARGET_STORE, 'readwrite');
+    tx.objectStore(EXPORT_TARGET_STORE).put(record, EXPORT_TARGET_KEY);
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      db.close();
+      resolve();
+    };
+  });
+};
+
+const sanitizeMusicarrFileName = (fileName: string) => {
+  const safeName = fileName
+    .trim()
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const baseName = safeName || 'arrangement';
+  return baseName.toLowerCase().endsWith('.musicarr') ? baseName : `${baseName}.musicarr`;
+};
+
 export default function App() {
   const [initialWorkbench] = useState(hydrateSavedTabs);
   const [tabs, setTabs] = useState<TabData[]>(() => initialWorkbench?.tabs ?? [createCodexSongTab()]);
@@ -756,6 +861,10 @@ export default function App() {
   const audioChunksRef = useRef<Blob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const importFileInputRef = useRef<HTMLInputElement>(null);
+  const exportFileHandleRef = useRef<ArrangementFileHandle | null>(null);
+  const [exportTarget, setExportTarget] = useState<ArrangementExportTarget | null>(null);
+  const [isExportingArrangement, setIsExportingArrangement] = useState(false);
+  const [isSavingArrangementFile, setIsSavingArrangementFile] = useState(false);
   const globalRecordStartedAtRef = useRef<number>(0);
   const globalRecorderRef = useRef<MediaRecorder | null>(null);
   const globalRecordChunksRef = useRef<Blob[]>([]);
@@ -864,6 +973,20 @@ export default function App() {
   useEffect(() => {
     setSaveStatus('idle');
   }, [tabs, selectedStyleId]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    loadStoredExportTarget().then((record) => {
+      if (cancelled || !record) return;
+      exportFileHandleRef.current = record.handle;
+      setExportTarget({ fileName: record.fileName, savedAt: record.savedAt, mode: 'file-handle' });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     window.localStorage.setItem(COLOR_MODE_STORAGE_KEY, colorMode);
@@ -1735,19 +1858,119 @@ export default function App() {
     };
   };
 
+  const createMusicarrText = async () => {
+    const payload = await createMusicarrPayload();
+    return JSON.stringify(payload, null, 2);
+  };
+
+  const createSuggestedExportFileName = () => {
+    const timestamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+    return sanitizeMusicarrFileName(`${activeTab?.name || 'arrangement'}-${timestamp}`);
+  };
+
+  const downloadMusicarrFile = (text: string, fileName: string) => {
+    const blob = new Blob([text], { type: MUSICARR_FILE_MIME });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = fileName;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const ensureArrangementFilePermission = async (handle: ArrangementFileHandle) => {
+    if (!handle.queryPermission || !handle.requestPermission) return true;
+
+    const descriptor = { mode: 'readwrite' as ArrangementFilePermissionMode };
+    const currentPermission = await handle.queryPermission(descriptor);
+    if (currentPermission === 'granted') return true;
+    const nextPermission = await handle.requestPermission(descriptor);
+    return nextPermission === 'granted';
+  };
+
+  const writeArrangementFile = async (handle: ArrangementFileHandle, text: string) => {
+    const hasPermission = await ensureArrangementFilePermission(handle);
+    if (!hasPermission) throw new Error('file-permission-denied');
+
+    const writable = await handle.createWritable();
+    await writable.write(new Blob([text], { type: MUSICARR_FILE_MIME }));
+    await writable.close();
+  };
+
+  const rememberExportTarget = async (handle: ArrangementFileHandle) => {
+    const target = {
+      fileName: handle.name,
+      savedAt: Date.now(),
+      mode: 'file-handle' as const,
+    };
+    exportFileHandleRef.current = handle;
+    setExportTarget(target);
+    await storeExportTarget({ ...target, handle });
+  };
+
+  const isPickerAbort = (err: unknown) => err instanceof DOMException && err.name === 'AbortError';
+
   const handleExportArrangement = async () => {
+    if (isExportingArrangement) return;
+    setIsExportingArrangement(true);
+
     try {
-      const payload = await createMusicarrPayload();
-      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = `arrangement-${Date.now()}.musicarr`;
-      anchor.click();
-      URL.revokeObjectURL(url);
+      const text = await createMusicarrText();
+      const suggestedName = createSuggestedExportFileName();
+      const saveFilePicker = (window as WindowWithArrangementFilePicker).showSaveFilePicker;
+
+      if (saveFilePicker) {
+        const handle = await saveFilePicker({
+          suggestedName,
+          types: [
+            {
+              description: 'Music Arrangement',
+              accept: {
+                [MUSICARR_FILE_MIME]: ['.musicarr'],
+              },
+            },
+          ],
+        });
+        await writeArrangementFile(handle, text);
+        await rememberExportTarget(handle);
+        return;
+      }
+
+      const fallbackName = window.prompt('请输入导出文件名', suggestedName);
+      if (!fallbackName) return;
+      const fileName = sanitizeMusicarrFileName(fallbackName);
+      downloadMusicarrFile(text, fileName);
+      exportFileHandleRef.current = null;
+      setExportTarget({ fileName, savedAt: Date.now(), mode: 'download' });
     } catch (err) {
+      if (isPickerAbort(err)) return;
       console.error('Export failed', err);
       alert('导出失败，请重试。');
+    } finally {
+      setIsExportingArrangement(false);
+    }
+  };
+
+  const handleSaveArrangementFile = async () => {
+    if (!exportTarget || isSavingArrangementFile || isExportingArrangement) return;
+    const handle = exportFileHandleRef.current;
+
+    setIsSavingArrangementFile(true);
+    try {
+      const text = await createMusicarrText();
+      if (handle) {
+        await writeArrangementFile(handle, text);
+        await rememberExportTarget(handle);
+      } else {
+        downloadMusicarrFile(text, exportTarget.fileName);
+        setExportTarget({ ...exportTarget, savedAt: Date.now() });
+      }
+    } catch (err) {
+      if (isPickerAbort(err)) return;
+      console.error('Save failed', err);
+      alert('保存失败，请确认浏览器文件权限，或点击 Export 重新选择保存位置。');
+    } finally {
+      setIsSavingArrangementFile(false);
     }
   };
 
@@ -3152,6 +3375,12 @@ export default function App() {
       : globalRecordingState === 'stopping'
         ? 'Waiting for the next global BPM loop start to finish recording'
         : 'Click to start recording at the next global BPM loop start';
+  const canSaveArrangementFile = Boolean(exportTarget) && !isSavingArrangementFile && !isExportingArrangement;
+  const saveArrangementTitle = exportTarget
+    ? exportTarget.mode === 'file-handle'
+      ? `保存到上次导出的文件：${exportTarget.fileName}`
+      : `使用上次导出文件名保存：${exportTarget.fileName}`
+    : '首次 Export 成功后可用';
 
   const renderLibraryCategory = (cat: { id: string; name: string }) => {
     const staticItems = AVAILABLE_SOUNDS.filter(s => s.category === cat.id);
@@ -3286,12 +3515,33 @@ export default function App() {
              New
           </button>
 
-          <button
-             onClick={handleExportArrangement}
-             className="px-3 py-2 rounded-lg bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white text-[9px] font-bold uppercase tracking-widest transition-all"
-          >
-             Export
-          </button>
+	          <button
+	             onClick={handleSaveArrangementFile}
+	             disabled={!canSaveArrangementFile}
+	             aria-label={saveArrangementTitle}
+	             title={saveArrangementTitle}
+	             className={cn(
+	               "px-3 py-2 rounded-lg text-[9px] font-bold uppercase tracking-widest transition-all inline-flex items-center gap-1.5",
+	               canSaveArrangementFile
+	                 ? "bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white"
+	                 : "bg-white/[0.03] text-zinc-700 cursor-not-allowed"
+	             )}
+	          >
+	             <Save size={12} strokeWidth={2.6} />
+	             {isSavingArrangementFile ? 'Saving' : 'Save'}
+	          </button>
+	          <button
+	             onClick={handleExportArrangement}
+	             disabled={isExportingArrangement || isSavingArrangementFile}
+	             className={cn(
+	               "px-3 py-2 rounded-lg text-[9px] font-bold uppercase tracking-widest transition-all",
+	               isExportingArrangement || isSavingArrangementFile
+	                 ? "bg-white/[0.03] text-zinc-700 cursor-wait"
+	                 : "bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white"
+	             )}
+	          >
+	             {isExportingArrangement ? 'Exporting' : 'Export'}
+	          </button>
           <button
              onClick={() => importFileInputRef.current?.click()}
              className="px-3 py-2 rounded-lg bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white text-[9px] font-bold uppercase tracking-widest transition-all"
