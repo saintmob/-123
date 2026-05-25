@@ -78,8 +78,6 @@ const parsePattern = (str: string) => {
   });
 };
 
-const sampleStep = () => ({ exp: 'sample' });
-
 export const AVAILABLE_SOUNDS: SoundDef[] = [
   // Beats
   { id: 'b1', name: 'House', category: 'beat', color: 'bg-red-500', pattern: parsePattern('K.H.S.H.K.H.S.H.') },
@@ -165,17 +163,6 @@ export const AVAILABLE_SOUNDS: SoundDef[] = [
   { id: 'x8', name: 'Bass Drop', category: 'experimental', color: 'bg-fuchsia-500', pattern: parsePattern('Y.......X.......') },
   { id: 'x9', name: 'Vinyl Fill', category: 'experimental', color: 'bg-fuchsia-500', pattern: parsePattern('X.....X.....X...') },
   { id: 'x10', name: 'Echo Throw', category: 'experimental', color: 'bg-fuchsia-500', pattern: parsePattern('....Y...Y.......') },
-
-  // Animal Samples
-  { id: 'a-mosquito-1', name: 'Mosquito Pin', category: 'animal', color: 'bg-lime-500', assetUrl: '/samples/animals/mosquito.mp3', assetStart: 0.12, assetDuration: 0.42, assetRate: 1.35, pattern: [sampleStep(), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}] },
-  { id: 'a-mosquito-2', name: 'Mosquito Orbit', category: 'animal', color: 'bg-lime-500', assetUrl: '/samples/animals/mosquito.mp3', assetStart: 1.1, assetDuration: 0.58, assetRate: 1.05, pattern: [{}, {}, sampleStep(), {}, {}, sampleStep(), {}, {}, {}, {}, sampleStep(), {}, {}, {}, {}, {}] },
-  { id: 'a-mosquito-3', name: 'Mosquito Swarm', category: 'animal', color: 'bg-lime-500', assetUrl: '/samples/animals/mosquito.mp3', assetStart: 2.25, assetDuration: 0.48, assetRate: 1.55, pattern: [sampleStep(), {}, sampleStep(), {}, sampleStep(), {}, {}, {}, {}, {}, sampleStep(), {}, sampleStep(), {}, {}, {}] },
-  { id: 'a-goat-1', name: 'Goat Bleat', category: 'animal', color: 'bg-stone-500', assetUrl: '/samples/animals/goat.mp3', assetStart: 0, assetDuration: 0.5, pattern: [{}, {}, {}, sampleStep(), {}, {}, {}, {}, {}, {}, {}, sampleStep(), {}, {}, {}, {}] },
-  { id: 'a-goat-2', name: 'Goat Wobble', category: 'animal', color: 'bg-stone-500', assetUrl: '/samples/animals/goat.mp3', assetStart: 0.14, assetDuration: 0.72, assetRate: 0.76, pattern: [sampleStep(), {}, {}, {}, {}, sampleStep(), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}] },
-  { id: 'a-cat-1', name: 'Cat Meow', category: 'animal', color: 'bg-pink-500', assetUrl: '/samples/animals/cat.mp3', assetStart: 0, assetDuration: 0.52, pattern: [{}, {}, sampleStep(), {}, {}, {}, {}, {}, {}, {}, {}, {}, sampleStep(), {}, {}, {}] },
-  { id: 'a-cat-2', name: 'Cat Chirp', category: 'animal', color: 'bg-pink-500', assetUrl: '/samples/animals/cat.mp3', assetStart: 0.08, assetDuration: 0.34, assetRate: 1.28, pattern: [sampleStep(), {}, {}, {}, {}, {}, {}, sampleStep(), {}, {}, {}, {}, {}, {}, {}, {}] },
-  { id: 'a-dog-1', name: 'Dog Bark', category: 'animal', color: 'bg-amber-500', assetUrl: '/samples/animals/dog.mp3', assetStart: 0, assetDuration: 0.45, pattern: [sampleStep(), {}, {}, {}, {}, {}, {}, {}, {}, {}, sampleStep(), {}, {}, {}, {}, {}] },
-  { id: 'a-dog-2', name: 'Dog Double', category: 'animal', color: 'bg-amber-500', assetUrl: '/samples/animals/dog.mp3', assetStart: 0.08, assetDuration: 0.28, assetRate: 1.15, pattern: [{}, {}, {}, {}, sampleStep(), sampleStep(), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}] },
 
   // Theme (旋律组)
   { id: 't1', name: '前奏', category: 'theme', color: 'bg-yellow-500', pattern: parsePattern('a..c..e..g..a...') },

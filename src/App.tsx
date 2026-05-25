@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus, RotateCcw, Shuffle, Keyboard, Circle, Wand2, Sun, Moon, Trash2, Radio, ListMusic, Scissors, Copy, MoveHorizontal, SkipBack, SkipForward, Pause, Save } from 'lucide-react';
+import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus, RotateCcw, Shuffle, Keyboard, Circle, Wand2, Sun, Moon, Trash2, Radio, ListMusic, Scissors, Copy, MoveHorizontal, SkipBack, SkipForward, Pause, Disc3 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { AUDIO_STYLES, AVAILABLE_SOUNDS, AudioStyleId, SoundDef, engineManager, FxParams, defaultFx, KEYBOARD_NOTES } from './audio';
+import { AUDIO_STYLES, AVAILABLE_SOUNDS, AudioStyleId, SoundDef, engineManager, FxParams, defaultFx, SlotChannel } from './audio';
 import { cn } from './lib/utils';
 import { createShowControlClient, type AudioFrameMessage, type ControlCommand } from './lib/showControlClient';
 
@@ -12,9 +12,33 @@ const KEYBOARD_INSTRUMENT_MODES = [
   { id: 'bell', name: 'Bell', color: 'bg-amber-500', waveform: 'triangle' as OscillatorType },
 ];
 
-const KEYBOARD_PHYSICAL_KEYS = ['a','s','d','f','g','h','j','k','l','q','w','e','r','t','y','u'];
-const KEYBOARD_NOTE_LABELS = ['C4','C#4','D4','D#4','E4','F4','F#4','G4','G#4','A4','A#4','B4','C5','C#5','D5','D#5'];
-const FLAT_KEYBOARD_NOTES = KEYBOARD_NOTES.flat();
+const BPM_PRESETS = [90, 110, 120, 130, 140, 160];
+const KEYBOARD_PHYSICAL_KEYS = ['q','w','e','r','t','y','u','i','o','p','a','s','d','f','g','h','j','k','l','z','x','c','v','b','n','m'];
+const KEYBOARD_BASE_NOTE = 48;
+const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const formatMidiLabel = (note: number) => `${NOTE_NAMES[note % 12]}${Math.floor(note / 12) - 1}`;
+const KEYBOARD_KEY_DEFS = KEYBOARD_PHYSICAL_KEYS.map((physicalKey, index) => {
+  const note = KEYBOARD_BASE_NOTE + index;
+  return {
+    physicalKey,
+    note,
+    label: formatMidiLabel(note),
+    isBlack: [1, 3, 6, 8, 10].includes(note % 12),
+  };
+});
+const KEYBOARD_KEY_ROWS = [
+  KEYBOARD_KEY_DEFS.slice(0, 10),
+  KEYBOARD_KEY_DEFS.slice(10, 19),
+  KEYBOARD_KEY_DEFS.slice(19),
+];
+const FLAT_KEYBOARD_NOTES = KEYBOARD_KEY_DEFS.map((key) => key.note);
+
+interface KeyboardRecordingNote {
+  time: number;
+  note: number;
+  instrumentId: string;
+  sustain: boolean;
+}
 
 type LiveFxKind = 'heartbeat' | 'atmosphere' | 'riser' | 'impact' | 'stutter' | 'air' | 'alarm' | 'spark';
 
@@ -59,6 +83,7 @@ interface TabData {
 
 type ViewMode = 'matrix' | 'timeline';
 type GlobalRecordingState = 'idle' | 'waiting' | 'recording' | 'stopping';
+type AppRoute = 'main' | 'dj';
 
 interface ArrangementEvent {
   id: string;
@@ -98,6 +123,14 @@ interface TimelineTransportEdit {
   wasPlaying: boolean;
 }
 
+interface ScratchEdit {
+  pointerStartX: number;
+  startPosition: number;
+  lastX: number;
+  lastAt: number;
+  wasPlaying: boolean;
+}
+
 interface StylePreset {
   id: string;
   name: string;
@@ -134,18 +167,48 @@ interface ArrangementSaveFilePickerOptions {
   }>;
 }
 
-interface ArrangementExportTarget {
-  fileName: string;
-  savedAt: number;
-  mode: 'file-handle' | 'download';
-}
-
-interface ArrangementExportTargetRecord extends ArrangementExportTarget {
-  handle: ArrangementFileHandle;
-}
-
 interface WindowWithArrangementFilePicker extends Window {
   showSaveFilePicker?: (options?: ArrangementSaveFilePickerOptions) => Promise<ArrangementFileHandle>;
+}
+
+interface PersistedSnapshot<T> {
+  version: string;
+  updatedAt: number;
+  data: T;
+  degraded?: boolean;
+}
+
+interface PersistedAudioBufferData {
+  bufferBase64: string;
+  sampleRate: number;
+  numberOfChannels: number;
+  duration: number;
+}
+
+interface PersistedDJTrack {
+  id: string;
+  fileName: string;
+  duration: number;
+  audio?: PersistedAudioBufferData;
+}
+
+interface PersistedDJState {
+  tracks: PersistedDJTrack[];
+  activeTrackId: string | null;
+  fileName?: string;
+  audio?: PersistedAudioBufferData;
+  position: number;
+  isReverse: boolean;
+  bpm: number;
+  playbackSpeed: number;
+  fx: FxParams;
+}
+
+interface PersistenceSyncMessage {
+  key: string;
+  updatedAt: number;
+  sourceId: string;
+  cleared?: boolean;
 }
 
 type MixerAudioTelemetry = AudioFrameMessage & {
@@ -165,9 +228,16 @@ type MixerAudioTelemetry = AudioFrameMessage & {
 const clampUnit = (value: number) => Math.max(0, Math.min(1, value));
 const average = (values: number[]) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
 const MUSICARR_FILE_MIME = 'application/json';
-const EXPORT_TARGET_DB_NAME = 'musicarr-export-target';
-const EXPORT_TARGET_STORE = 'targets';
-const EXPORT_TARGET_KEY = 'last-export';
+const PERSISTENCE_DB_NAME = 'codex-music-editor-persistence';
+const PERSISTENCE_DB_VERSION = 1;
+const PERSISTENCE_STATE_VERSION = '2026-05-24-dj-queue-v1';
+const PERSISTENCE_STORE = 'snapshots';
+const MAIN_PERSISTENCE_KEY = 'main-editor';
+const DJ_PERSISTENCE_KEY = 'dj-audio-editor';
+const PERSISTENCE_SYNC_CHANNEL = 'codex-music-editor-persistence-sync';
+const PERSISTENCE_SYNC_STORAGE_KEY = 'codex-music-editor-persistence-sync-event';
+const PERSISTENCE_LOCAL_STORAGE_PREFIX = 'codex-music-editor-persist:';
+const DJ_AUDIO_ROUTE = '/dj-audio';
 const BAND_SHAPE = [0.22, 0.45, 0.74, 1, 0.74, 0.45, 0.22];
 const CATEGORY_BAND_CENTERS: Record<string, number> = {
   beat: 1,
@@ -189,6 +259,33 @@ const CATEGORY_IMPACT: Record<string, number> = {
   effect: 0.68,
   experimental: 0.64,
 };
+
+const DJ_FX_CONTROLS: { key: keyof FxParams; name: string; min: number; max: number; step?: number }[] = [
+  { key: 'lpf', name: 'DJ Lowpass', min: 0, max: 100 },
+  { key: 'hpf', name: 'Highpass', min: 0, max: 100 },
+  { key: 'volume', name: 'Volume', min: 0, max: 100 },
+  { key: 'sidechain', name: 'Ducking', min: 0, max: 100 },
+  { key: 'reverb', name: 'Reverb', min: 0, max: 100 },
+  { key: 'delay', name: 'Echo', min: 0, max: 100 },
+  { key: 'pitch', name: 'Pitch', min: -12, max: 12, step: 1 },
+  { key: 'panSwing', name: 'Pan Swing', min: 0, max: 100 },
+  { key: 'compressor', name: 'Compressor', min: 0, max: 100 },
+  { key: 'flanger', name: 'Flanger', min: 0, max: 100 },
+];
+
+const getAppRouteFromPath = (): AppRoute => {
+  if (typeof window === 'undefined') return 'main';
+  return window.location.pathname === DJ_AUDIO_ROUTE ? 'dj' : 'main';
+};
+
+const formatDjTime = (value: number) => {
+  if (!Number.isFinite(value)) return '0:00';
+  const minutes = Math.floor(Math.max(0, value) / 60);
+  const seconds = Math.floor(Math.max(0, value) % 60).toString().padStart(2, '0');
+  return `${minutes}:${seconds}`;
+};
+
+const createDjTrackId = () => `dj-track-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
 
 const makeFx = (overrides: Partial<FxParams> = {}): FxParams => ({
   ...defaultFx(),
@@ -750,17 +847,32 @@ const hydrateSavedTabs = (): { tabs: TabData[]; styleId: string } | null => {
   }
 };
 
-const openExportTargetDb = () => new Promise<IDBDatabase | null>((resolve) => {
+const sanitizeMusicarrFileName = (fileName: string) => {
+  const safeName = fileName
+    .trim()
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const baseName = safeName || 'arrangement';
+  return baseName.toLowerCase().endsWith('.musicarr') ? baseName : `${baseName}.musicarr`;
+};
+
+const isQuotaExceededError = (err: unknown) => (
+  err instanceof DOMException
+  && (err.name === 'QuotaExceededError' || err.name === 'NS_ERROR_DOM_QUOTA_REACHED')
+);
+
+const openPersistenceDb = () => new Promise<IDBDatabase | null>((resolve) => {
   if (typeof indexedDB === 'undefined') {
     resolve(null);
     return;
   }
 
-  const request = indexedDB.open(EXPORT_TARGET_DB_NAME, 1);
+  const request = indexedDB.open(PERSISTENCE_DB_NAME, PERSISTENCE_DB_VERSION);
   request.onupgradeneeded = () => {
     const db = request.result;
-    if (!db.objectStoreNames.contains(EXPORT_TARGET_STORE)) {
-      db.createObjectStore(EXPORT_TARGET_STORE);
+    if (!db.objectStoreNames.contains(PERSISTENCE_STORE)) {
+      db.createObjectStore(PERSISTENCE_STORE);
     }
   };
   request.onsuccess = () => resolve(request.result);
@@ -768,16 +880,36 @@ const openExportTargetDb = () => new Promise<IDBDatabase | null>((resolve) => {
   request.onblocked = () => resolve(null);
 });
 
-const loadStoredExportTarget = async (): Promise<ArrangementExportTargetRecord | null> => {
-  const db = await openExportTargetDb();
-  if (!db) return null;
+const localPersistenceKey = (key: string) => `${PERSISTENCE_LOCAL_STORAGE_PREFIX}${key}`;
+
+const readPersistedSnapshot = async <T,>(key: string): Promise<PersistedSnapshot<T> | null> => {
+  const db = await openPersistenceDb();
+  if (!db) {
+    try {
+      const raw = window.localStorage.getItem(localPersistenceKey(key));
+      if (!raw) return null;
+      const snapshot = JSON.parse(raw) as PersistedSnapshot<T>;
+      if (snapshot.version !== PERSISTENCE_STATE_VERSION) {
+        window.localStorage.removeItem(localPersistenceKey(key));
+        return null;
+      }
+      return snapshot;
+    } catch {
+      return null;
+    }
+  }
 
   return new Promise((resolve) => {
-    const tx = db.transaction(EXPORT_TARGET_STORE, 'readonly');
-    const request = tx.objectStore(EXPORT_TARGET_STORE).get(EXPORT_TARGET_KEY);
+    const tx = db.transaction(PERSISTENCE_STORE, 'readonly');
+    const request = tx.objectStore(PERSISTENCE_STORE).get(key);
     request.onsuccess = () => {
-      const record = request.result as ArrangementExportTargetRecord | undefined;
-      resolve(record?.handle ? record : null);
+      const snapshot = request.result as PersistedSnapshot<T> | undefined;
+      if (!snapshot || snapshot.version !== PERSISTENCE_STATE_VERSION) {
+        if (snapshot) setTimeout(() => deletePersistedSnapshot(key), 0);
+        resolve(null);
+        return;
+      }
+      resolve(snapshot);
     };
     request.onerror = () => resolve(null);
     tx.oncomplete = () => db.close();
@@ -788,13 +920,47 @@ const loadStoredExportTarget = async (): Promise<ArrangementExportTargetRecord |
   });
 };
 
-const storeExportTarget = async (record: ArrangementExportTargetRecord) => {
-  const db = await openExportTargetDb();
-  if (!db) return;
+const writePersistedSnapshot = async <T,>(key: string, snapshot: PersistedSnapshot<T>) => {
+  const db = await openPersistenceDb();
+  if (!db) {
+    window.localStorage.setItem(localPersistenceKey(key), JSON.stringify(snapshot));
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(PERSISTENCE_STORE, 'readwrite');
+    tx.objectStore(PERSISTENCE_STORE).put(snapshot, key);
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      const err = tx.error;
+      db.close();
+      reject(err);
+    };
+    tx.onabort = () => {
+      const err = tx.error;
+      db.close();
+      reject(err);
+    };
+  });
+};
+
+const deletePersistedSnapshot = async (key: string) => {
+  const db = await openPersistenceDb();
+  if (!db) {
+    try {
+      window.localStorage.removeItem(localPersistenceKey(key));
+    } catch {
+      // Ignore local cache cleanup failures.
+    }
+    return;
+  }
 
   await new Promise<void>((resolve) => {
-    const tx = db.transaction(EXPORT_TARGET_STORE, 'readwrite');
-    tx.objectStore(EXPORT_TARGET_STORE).put(record, EXPORT_TARGET_KEY);
+    const tx = db.transaction(PERSISTENCE_STORE, 'readwrite');
+    tx.objectStore(PERSISTENCE_STORE).delete(key);
     tx.oncomplete = () => {
       db.close();
       resolve();
@@ -806,29 +972,1138 @@ const storeExportTarget = async (record: ArrangementExportTargetRecord) => {
   });
 };
 
-const sanitizeMusicarrFileName = (fileName: string) => {
-  const safeName = fileName
-    .trim()
-    .replace(/[\\/:*?"<>|]+/g, '-')
-    .replace(/\s+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  const baseName = safeName || 'arrangement';
-  return baseName.toLowerCase().endsWith('.musicarr') ? baseName : `${baseName}.musicarr`;
+const emitPersistenceSync = (message: PersistenceSyncMessage) => {
+  if (typeof window === 'undefined') return;
+  try {
+    const channel = new BroadcastChannel(PERSISTENCE_SYNC_CHANNEL);
+    channel.postMessage(message);
+    channel.close();
+  } catch {
+    // BroadcastChannel is optional; storage events provide the fallback.
+  }
+
+  try {
+    window.localStorage.setItem(PERSISTENCE_SYNC_STORAGE_KEY, JSON.stringify(message));
+  } catch {
+    // Ignore sync fallback failures.
+  }
 };
+
+const encodePersistedAudioBuffer = (buffer: AudioBuffer): PersistedAudioBufferData => {
+  const numChannels = buffer.numberOfChannels;
+  const sampleRate = buffer.sampleRate;
+  const bitsPerSample = 16;
+  const blockAlign = numChannels * bitsPerSample / 8;
+  const wav = new ArrayBuffer(44 + buffer.length * blockAlign);
+  const view = new DataView(wav);
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + buffer.length * blockAlign, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeString(36, 'data');
+  view.setUint32(40, buffer.length * blockAlign, true);
+
+  const offset = 44;
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    let idx = offset + channel * 2;
+    for (let i = 0; i < buffer.length; i++) {
+      const sample = Math.max(-1, Math.min(1, channelData[i]));
+      view.setInt16(idx, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+      idx += blockAlign;
+    }
+  }
+
+  const bytes = new Uint8Array(wav);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+
+  return {
+    bufferBase64: btoa(binary),
+    sampleRate,
+    numberOfChannels: numChannels,
+    duration: buffer.duration,
+  };
+};
+
+const decodePersistedAudioBuffer = async (ctx: AudioContext, data: PersistedAudioBufferData) => {
+  const binaryString = atob(data.bufferBase64);
+  const arrayBuffer = new ArrayBuffer(binaryString.length);
+  const view = new Uint8Array(arrayBuffer);
+  for (let i = 0; i < binaryString.length; i++) {
+    view[i] = binaryString.charCodeAt(i);
+  }
+  return ctx.decodeAudioData(arrayBuffer);
+};
+
+function DJAudioEditorPage({ onBack }: { onBack: () => void }) {
+  const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
+  const [djTracks, setDjTracks] = useState<PersistedDJTrack[]>([]);
+  const [activeTrackId, setActiveTrackId] = useState<string | null>(null);
+  const [draggingTrackId, setDraggingTrackId] = useState<string | null>(null);
+  const [fileName, setFileName] = useState('No audio loaded');
+  const [djPosition, setDjPosition] = useState(0);
+  const [isDjPlaying, setIsDjPlaying] = useState(false);
+  const [isReverse, setIsReverse] = useState(false);
+  const [djBpm, setDjBpm] = useState(120);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [djFx, setDjFx] = useState<FxParams>(() => makeFx({ volume: 92, compressor: 12 }));
+  const [isLoadingAudio, setIsLoadingAudio] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const ctxRef = useRef<AudioContext | null>(null);
+  const channelRef = useRef<SlotChannel | null>(null);
+  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const audioBufferRef = useRef<AudioBuffer | null>(null);
+  const djTracksRef = useRef<PersistedDJTrack[]>([]);
+  const activeTrackIdRef = useRef<string | null>(null);
+  const reverseBufferRef = useRef<AudioBuffer | null>(null);
+  const animationRef = useRef<number | null>(null);
+  const startedAtRef = useRef(0);
+  const basePositionRef = useRef(0);
+  const positionRef = useRef(0);
+  const isPlayingRef = useRef(false);
+  const reverseRef = useRef(false);
+  const speedRef = useRef(1);
+  const fxRef = useRef(djFx);
+  const effectiveRateRef = useRef(1);
+  const scratchEditRef = useRef<ScratchEdit | null>(null);
+  const persistenceSourceIdRef = useRef(`dj-${crypto.randomUUID().slice(0, 8)}`);
+  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hasHydratedPersistenceRef = useRef(false);
+  const isApplyingPersistenceRef = useRef(false);
+  const lastPersistenceUpdateRef = useRef(0);
+  const quotaWarningShownRef = useRef(false);
+
+  const duration = audioBuffer?.duration ?? 0;
+  const activeTrack = djTracks.find((track) => track.id === activeTrackId) ?? null;
+
+  const ensureAudioGraph = () => {
+    const AudioContextClass = window.AudioContext;
+    const ctx = ctxRef.current ?? new AudioContextClass();
+    ctxRef.current = ctx;
+    if (!channelRef.current) {
+      channelRef.current = new SlotChannel(ctx, ctx.destination);
+      channelRef.current.applyParams(fxRef.current);
+      channelRef.current.sidechainLFO.frequency.setValueAtTime(djBpm / 60, ctx.currentTime);
+    }
+    return { ctx, channel: channelRef.current };
+  };
+
+  const clampPosition = (value: number) => Math.max(0, Math.min(value, audioBufferRef.current?.duration ?? 0));
+
+  const getEffectiveRate = () => Math.max(0.05, speedRef.current * Math.pow(2, fxRef.current.pitch / 12));
+
+  const updateSourceRate = () => {
+    const rate = getEffectiveRate();
+    effectiveRateRef.current = rate;
+    const source = sourceRef.current;
+    const ctx = ctxRef.current;
+    if (source && ctx) {
+      source.playbackRate.setTargetAtTime(rate, ctx.currentTime, 0.02);
+    }
+  };
+
+  const getReverseBuffer = () => {
+    const buffer = audioBufferRef.current;
+    if (!buffer) return null;
+    if (reverseBufferRef.current) return reverseBufferRef.current;
+    const { ctx } = ensureAudioGraph();
+    const reversed = ctx.createBuffer(buffer.numberOfChannels, buffer.length, buffer.sampleRate);
+    for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+      const src = buffer.getChannelData(channel);
+      const dst = reversed.getChannelData(channel);
+      for (let i = 0; i < src.length; i++) {
+        dst[i] = src[src.length - 1 - i];
+      }
+    }
+    reverseBufferRef.current = reversed;
+    return reversed;
+  };
+
+  const getPlaybackBuffer = (reverse = reverseRef.current) => reverse ? getReverseBuffer() : audioBufferRef.current;
+
+  const getLivePosition = () => {
+    const buffer = audioBufferRef.current;
+    const ctx = ctxRef.current;
+    if (!buffer || !ctx || !isPlayingRef.current) return positionRef.current;
+    const elapsed = (ctx.currentTime - startedAtRef.current) * effectiveRateRef.current;
+    const next = reverseRef.current ? basePositionRef.current - elapsed : basePositionRef.current + elapsed;
+    return Math.max(0, Math.min(buffer.duration, next));
+  };
+
+  const clearAnimation = () => {
+    if (animationRef.current !== null) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = null;
+    }
+  };
+
+  const stopCurrentSource = () => {
+    const source = sourceRef.current;
+    if (!source) return;
+    sourceRef.current = null;
+    source.onended = null;
+    try {
+      source.stop();
+    } catch {
+      // Source may already be stopped by the audio engine.
+    }
+    source.disconnect();
+  };
+
+  const syncPosition = (next: number) => {
+    const clamped = clampPosition(next);
+    positionRef.current = clamped;
+    setDjPosition(clamped);
+    return clamped;
+  };
+
+  const createDjPersistenceData = (includeAudio: boolean): PersistedDJState => ({
+    tracks: djTracksRef.current.map((track) => ({
+      ...track,
+      audio: includeAudio ? track.audio : undefined,
+    })),
+    activeTrackId: activeTrackIdRef.current,
+    position: positionRef.current,
+    isReverse,
+    bpm: djBpm,
+    playbackSpeed,
+    fx: djFx,
+  });
+
+  const persistDjState = async (includeAudio = true) => {
+    if (!hasHydratedPersistenceRef.current || isApplyingPersistenceRef.current) return;
+    const updatedAt = Date.now();
+    const snapshot: PersistedSnapshot<PersistedDJState> = {
+      version: PERSISTENCE_STATE_VERSION,
+      updatedAt,
+      data: createDjPersistenceData(includeAudio),
+      degraded: !includeAudio,
+    };
+
+    try {
+      await writePersistedSnapshot(DJ_PERSISTENCE_KEY, snapshot);
+      lastPersistenceUpdateRef.current = updatedAt;
+      emitPersistenceSync({ key: DJ_PERSISTENCE_KEY, updatedAt, sourceId: persistenceSourceIdRef.current });
+    } catch (err) {
+      if (includeAudio && isQuotaExceededError(err)) {
+        if (!quotaWarningShownRef.current) {
+          quotaWarningShownRef.current = true;
+          alert('浏览器本地存储空间不足，已优先保留最新编辑参数；当前上传音频可能无法完整缓存。');
+        }
+        await persistDjState(false);
+        return;
+      }
+      console.error('DJ persistence failed', err);
+    }
+  };
+
+  const queueDjPersistence = () => {
+    if (!hasHydratedPersistenceRef.current || isApplyingPersistenceRef.current) return;
+    if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+    persistTimerRef.current = setTimeout(() => {
+      persistTimerRef.current = null;
+      persistDjState();
+    }, 700);
+  };
+
+  const applyDjPersistedState = async (snapshot: PersistedSnapshot<PersistedDJState>) => {
+    isApplyingPersistenceRef.current = true;
+    try {
+      pauseDjPlayback();
+      const data = snapshot.data;
+      const restoredTracks = Array.isArray(data.tracks)
+        ? data.tracks
+        : data.audio
+          ? [{
+              id: createDjTrackId(),
+              fileName: data.fileName ?? 'Restored audio',
+              duration: data.audio.duration,
+              audio: data.audio,
+            }]
+          : [];
+      const nextActiveId = data.activeTrackId && restoredTracks.some((track) => track.id === data.activeTrackId)
+        ? data.activeTrackId
+        : restoredTracks[0]?.id ?? null;
+      const currentTrack = restoredTracks.find((track) => track.id === nextActiveId) ?? null;
+      let restoredBuffer: AudioBuffer | null = null;
+      if (currentTrack?.audio) {
+        const { ctx } = ensureAudioGraph();
+        restoredBuffer = await decodePersistedAudioBuffer(ctx, currentTrack.audio);
+      }
+
+      djTracksRef.current = restoredTracks;
+      activeTrackIdRef.current = nextActiveId;
+      audioBufferRef.current = restoredBuffer;
+      reverseBufferRef.current = null;
+      setDjTracks(restoredTracks);
+      setActiveTrackId(nextActiveId);
+      setAudioBuffer(restoredBuffer);
+      setFileName(currentTrack ? currentTrack.fileName : 'No audio loaded');
+      const nextPosition = Math.max(0, Math.min(data.position || 0, restoredBuffer?.duration ?? 0));
+      syncPosition(nextPosition);
+      reverseRef.current = data.isReverse;
+      setIsReverse(data.isReverse);
+      speedRef.current = data.playbackSpeed || 1;
+      setPlaybackSpeed(data.playbackSpeed || 1);
+      setDjBpm(data.bpm || 120);
+      const nextFx = { ...defaultFx(), ...data.fx };
+      fxRef.current = nextFx;
+      setDjFx(nextFx);
+      channelRef.current?.applyParams(nextFx);
+      if (channelRef.current && ctxRef.current) {
+        channelRef.current.sidechainLFO.frequency.setTargetAtTime((data.bpm || 120) / 60, ctxRef.current.currentTime, 0.05);
+      }
+      lastPersistenceUpdateRef.current = snapshot.updatedAt;
+    } finally {
+      isApplyingPersistenceRef.current = false;
+    }
+  };
+
+  const resetDjEditorState = async (emit = true) => {
+    pauseDjPlayback();
+    audioBufferRef.current = null;
+    djTracksRef.current = [];
+    activeTrackIdRef.current = null;
+    reverseBufferRef.current = null;
+    setDjTracks([]);
+    setActiveTrackId(null);
+    setAudioBuffer(null);
+    setFileName('No audio loaded');
+    syncPosition(0);
+    reverseRef.current = false;
+    setIsReverse(false);
+    speedRef.current = 1;
+    setPlaybackSpeed(1);
+    setDjBpm(120);
+    const nextFx = makeFx({ volume: 92, compressor: 12 });
+    fxRef.current = nextFx;
+    setDjFx(nextFx);
+    channelRef.current?.applyParams(nextFx);
+    const updatedAt = Date.now();
+    lastPersistenceUpdateRef.current = updatedAt;
+    await deletePersistedSnapshot(DJ_PERSISTENCE_KEY);
+    if (emit) {
+      emitPersistenceSync({ key: DJ_PERSISTENCE_KEY, updatedAt, sourceId: persistenceSourceIdRef.current, cleared: true });
+    }
+  };
+
+  const loadDjTrackById = async (
+    trackId: string,
+    options: { autoplay?: boolean; position?: number; keepReverse?: boolean } = {}
+  ) => {
+    const track = djTracksRef.current.find((item) => item.id === trackId);
+    if (!track) return false;
+    if (!track.audio) {
+      alert('该曲目的音频缓存缺失，请重新上传后再播放。');
+      return false;
+    }
+
+    const wasPlaying = isPlayingRef.current;
+    if (wasPlaying) pauseDjPlayback();
+    setIsLoadingAudio(true);
+    try {
+      const { ctx } = ensureAudioGraph();
+      const buffer = await decodePersistedAudioBuffer(ctx, track.audio);
+      activeTrackIdRef.current = track.id;
+      audioBufferRef.current = buffer;
+      reverseBufferRef.current = null;
+      setActiveTrackId(track.id);
+      setAudioBuffer(buffer);
+      setFileName(track.fileName);
+      syncPosition(Math.max(0, Math.min(options.position ?? 0, buffer.duration)));
+      if (!options.keepReverse) {
+        reverseRef.current = false;
+        setIsReverse(false);
+      }
+      if (options.autoplay) {
+        requestAnimationFrame(() => startDjPlayback(positionRef.current, reverseRef.current));
+      }
+      return true;
+    } catch (err) {
+      console.error('DJ track load failed', err);
+      alert('曲目加载失败，请重新上传该音频。');
+      return false;
+    } finally {
+      setIsLoadingAudio(false);
+    }
+  };
+
+  const getNextDjTrack = () => {
+    const tracks = djTracksRef.current;
+    const currentIndex = tracks.findIndex((track) => track.id === activeTrackIdRef.current);
+    if (currentIndex === -1) return null;
+    return tracks.slice(currentIndex + 1).find((track) => track.audio) ?? null;
+  };
+
+  const finishDjTrack = () => {
+    const buffer = audioBufferRef.current;
+    const shouldAdvance = !reverseRef.current;
+    clearAnimation();
+    stopCurrentSource();
+    isPlayingRef.current = false;
+    setIsDjPlaying(false);
+
+    if (shouldAdvance) {
+      const nextTrack = getNextDjTrack();
+      if (nextTrack) {
+        syncPosition(buffer?.duration ?? positionRef.current);
+        loadDjTrackById(nextTrack.id, { autoplay: true, position: 0, keepReverse: true });
+        return;
+      }
+    }
+
+    syncPosition(reverseRef.current ? 0 : buffer?.duration ?? positionRef.current);
+  };
+
+  const selectDjTrackForPlayback = async (trackId: string) => {
+    if (trackId === activeTrackIdRef.current && audioBufferRef.current) {
+      startDjPlayback(positionRef.current, reverseRef.current);
+      return;
+    }
+    await loadDjTrackById(trackId, { autoplay: true, position: 0, keepReverse: true });
+  };
+
+  const removeDjTrack = async (event: React.MouseEvent<HTMLButtonElement>, trackId: string) => {
+    event.stopPropagation();
+    const tracks = djTracksRef.current;
+    const removeIndex = tracks.findIndex((track) => track.id === trackId);
+    if (removeIndex === -1) return;
+    const nextTracks = tracks.filter((track) => track.id !== trackId);
+    djTracksRef.current = nextTracks;
+    setDjTracks(nextTracks);
+
+    if (trackId !== activeTrackIdRef.current) return;
+
+    pauseDjPlayback();
+    const nextTrack = nextTracks[Math.min(removeIndex, nextTracks.length - 1)] ?? null;
+    if (nextTrack) {
+      await loadDjTrackById(nextTrack.id, { position: 0, keepReverse: true });
+      return;
+    }
+
+    activeTrackIdRef.current = null;
+    audioBufferRef.current = null;
+    reverseBufferRef.current = null;
+    setActiveTrackId(null);
+    setAudioBuffer(null);
+    setFileName('No audio loaded');
+    syncPosition(0);
+  };
+
+  const reorderDjTrack = (draggedId: string, targetId: string, placement: 'before' | 'after' = 'before') => {
+    if (draggedId === targetId) return;
+    setDjTracks((current) => {
+      const fromIndex = current.findIndex((track) => track.id === draggedId);
+      const toIndex = current.findIndex((track) => track.id === targetId);
+      if (fromIndex === -1 || toIndex === -1) return current;
+      const next = [...current];
+      const [dragged] = next.splice(fromIndex, 1);
+      const targetIndex = next.findIndex((track) => track.id === targetId);
+      next.splice(placement === 'after' ? targetIndex + 1 : targetIndex, 0, dragged);
+      djTracksRef.current = next;
+      return next;
+    });
+  };
+
+  const tickPlayback = () => {
+    const next = syncPosition(getLivePosition());
+    const buffer = audioBufferRef.current;
+    if (!buffer) return;
+    if ((!reverseRef.current && next >= buffer.duration - 0.01) || (reverseRef.current && next <= 0.01)) {
+      finishDjTrack();
+      return;
+    }
+    animationRef.current = requestAnimationFrame(tickPlayback);
+  };
+
+  const anchorLivePlayback = () => {
+    if (!isPlayingRef.current || !ctxRef.current) return;
+    const live = syncPosition(getLivePosition());
+    basePositionRef.current = live;
+    startedAtRef.current = ctxRef.current.currentTime;
+  };
+
+  const startDjPlayback = async (position = positionRef.current, reverse = reverseRef.current) => {
+    const baseBuffer = audioBufferRef.current;
+    if (!baseBuffer) return;
+    const { ctx, channel } = ensureAudioGraph();
+    await ctx.resume();
+    stopCurrentSource();
+    clearAnimation();
+
+    const buffer = getPlaybackBuffer(reverse);
+    if (!buffer) return;
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    const rate = getEffectiveRate();
+    effectiveRateRef.current = rate;
+    source.playbackRate.value = rate;
+    source.connect(channel.input);
+
+    const startPosition = reverse
+      ? (position <= 0.01 ? baseBuffer.duration : clampPosition(position))
+      : (position >= baseBuffer.duration - 0.01 ? 0 : clampPosition(position));
+    const offset = reverse
+      ? Math.max(0, Math.min(baseBuffer.duration - 0.01, baseBuffer.duration - startPosition))
+      : Math.max(0, Math.min(baseBuffer.duration - 0.01, startPosition));
+
+    source.onended = () => {
+      if (sourceRef.current !== source) return;
+      finishDjTrack();
+    };
+
+    sourceRef.current = source;
+    reverseRef.current = reverse;
+    basePositionRef.current = startPosition;
+    startedAtRef.current = ctx.currentTime;
+    syncPosition(startPosition);
+    isPlayingRef.current = true;
+    setIsDjPlaying(true);
+    source.start(0, offset);
+    animationRef.current = requestAnimationFrame(tickPlayback);
+  };
+
+  const pauseDjPlayback = () => {
+    const live = getLivePosition();
+    clearAnimation();
+    stopCurrentSource();
+    isPlayingRef.current = false;
+    setIsDjPlaying(false);
+    syncPosition(live);
+  };
+
+  const seekDjPosition = (next: number) => {
+    const wasPlaying = isPlayingRef.current;
+    if (wasPlaying) {
+      startDjPlayback(next);
+    } else {
+      syncPosition(next);
+    }
+  };
+
+  const handleAudioUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = event.target.files;
+    const files: File[] = fileList ? Array.from(fileList as ArrayLike<File>) : [];
+    if (!files.length) return;
+    setIsLoadingAudio(true);
+    try {
+      const { ctx } = ensureAudioGraph();
+      const nextTracks: PersistedDJTrack[] = [];
+      let firstLoadedBuffer: AudioBuffer | null = null;
+      let firstLoadedTrack: PersistedDJTrack | null = null;
+
+      for (const file of files) {
+        const arrayBuffer = await file.arrayBuffer();
+        const buffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+        const track: PersistedDJTrack = {
+          id: createDjTrackId(),
+          fileName: file.name,
+          duration: buffer.duration,
+          audio: encodePersistedAudioBuffer(buffer),
+        };
+        nextTracks.push(track);
+        if (!firstLoadedTrack) {
+          firstLoadedTrack = track;
+          firstLoadedBuffer = buffer;
+        }
+      }
+
+      setDjTracks((current) => {
+        const merged = [...current, ...nextTracks];
+        djTracksRef.current = merged;
+        return merged;
+      });
+
+      if (!activeTrackIdRef.current && firstLoadedTrack && firstLoadedBuffer) {
+        activeTrackIdRef.current = firstLoadedTrack.id;
+        audioBufferRef.current = firstLoadedBuffer;
+        reverseBufferRef.current = null;
+        setActiveTrackId(firstLoadedTrack.id);
+        setAudioBuffer(firstLoadedBuffer);
+        setFileName(firstLoadedTrack.fileName);
+        syncPosition(0);
+        setIsReverse(false);
+        reverseRef.current = false;
+      }
+    } catch (err) {
+      console.error('DJ audio load failed', err);
+      alert('音频加载失败，请换一个音频文件再试。');
+    } finally {
+      setIsLoadingAudio(false);
+      event.target.value = '';
+    }
+  };
+
+  const handleSpeedChange = (next: number) => {
+    anchorLivePlayback();
+    speedRef.current = next;
+    setPlaybackSpeed(next);
+    updateSourceRate();
+  };
+
+  const handleBpmChange = (next: number) => {
+    setDjBpm(next);
+    const channel = channelRef.current;
+    const ctx = ctxRef.current;
+    if (channel && ctx) {
+      channel.sidechainLFO.frequency.setTargetAtTime(next / 60, ctx.currentTime, 0.05);
+    }
+  };
+
+  const handleFxChange = (key: keyof FxParams, value: number) => {
+    if (key === 'pitch') anchorLivePlayback();
+    const next = { ...fxRef.current, [key]: value };
+    fxRef.current = next;
+    setDjFx(next);
+    channelRef.current?.applyParams(next);
+    updateSourceRate();
+  };
+
+  const toggleReversePlayback = () => {
+    const wasPlaying = isPlayingRef.current;
+    const live = getLivePosition();
+    stopCurrentSource();
+    clearAnimation();
+    const nextReverse = !reverseRef.current;
+    reverseRef.current = nextReverse;
+    setIsReverse(nextReverse);
+    isPlayingRef.current = false;
+    setIsDjPlaying(false);
+    syncPosition(live);
+    if (wasPlaying) {
+      requestAnimationFrame(() => startDjPlayback(live, nextReverse));
+    }
+  };
+
+  const rewindDjAudio = () => {
+    seekDjPosition(Math.max(0, getLivePosition() - 5));
+  };
+
+  const jumpDjStart = () => {
+    seekDjPosition(0);
+  };
+
+  const triggerScratchGrain = (position: number, deltaX: number, velocity: number) => {
+    const baseBuffer = audioBufferRef.current;
+    if (!baseBuffer || Math.abs(deltaX) < 1) return;
+    const { ctx, channel } = ensureAudioGraph();
+    const reverse = deltaX < 0;
+    const buffer = reverse ? getReverseBuffer() : baseBuffer;
+    if (!buffer) return;
+
+    const source = ctx.createBufferSource();
+    const gain = ctx.createGain();
+    const now = ctx.currentTime;
+    const grainDuration = 0.11;
+    const offset = reverse
+      ? Math.max(0, Math.min(baseBuffer.duration - grainDuration, baseBuffer.duration - position))
+      : Math.max(0, Math.min(baseBuffer.duration - grainDuration, position));
+    source.buffer = buffer;
+    source.playbackRate.value = Math.max(0.35, Math.min(2.4, 0.75 + Math.abs(velocity) / 360));
+    gain.gain.setValueAtTime(0.001, now);
+    gain.gain.exponentialRampToValueAtTime(0.55, now + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + grainDuration);
+    source.connect(gain);
+    gain.connect(channel.input);
+    source.start(now, offset, grainDuration);
+    source.stop(now + grainDuration + 0.02);
+  };
+
+  const beginScratch = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!audioBufferRef.current) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    const live = getLivePosition();
+    const wasPlaying = isPlayingRef.current;
+    clearAnimation();
+    stopCurrentSource();
+    isPlayingRef.current = false;
+    setIsDjPlaying(false);
+    syncPosition(live);
+    scratchEditRef.current = {
+      pointerStartX: event.clientX,
+      startPosition: live,
+      lastX: event.clientX,
+      lastAt: performance.now(),
+      wasPlaying,
+    };
+  };
+
+  const moveScratch = (event: React.PointerEvent<HTMLDivElement>) => {
+    const edit = scratchEditRef.current;
+    const buffer = audioBufferRef.current;
+    if (!edit || !buffer) return;
+    event.preventDefault();
+    const now = performance.now();
+    const dx = event.clientX - edit.pointerStartX;
+    const next = syncPosition(edit.startPosition + (dx / 520) * buffer.duration);
+    const timeDelta = Math.max(1, now - edit.lastAt);
+    const moveDelta = event.clientX - edit.lastX;
+    if (Math.abs(moveDelta) > 1.5 && timeDelta > 24) {
+      triggerScratchGrain(next, moveDelta, (moveDelta / timeDelta) * 1000);
+      edit.lastX = event.clientX;
+      edit.lastAt = now;
+    }
+  };
+
+  const endScratch = () => {
+    const edit = scratchEditRef.current;
+    if (!edit) return;
+    scratchEditRef.current = null;
+    if (edit.wasPlaying) {
+      startDjPlayback(positionRef.current, reverseRef.current);
+    }
+  };
+
+  useEffect(() => {
+    audioBufferRef.current = audioBuffer;
+  }, [audioBuffer]);
+
+  useEffect(() => {
+    djTracksRef.current = djTracks;
+  }, [djTracks]);
+
+  useEffect(() => {
+    activeTrackIdRef.current = activeTrackId;
+  }, [activeTrackId]);
+
+  useEffect(() => {
+    positionRef.current = djPosition;
+  }, [djPosition]);
+
+  useEffect(() => {
+    isPlayingRef.current = isDjPlaying;
+  }, [isDjPlaying]);
+
+  useEffect(() => {
+    reverseRef.current = isReverse;
+  }, [isReverse]);
+
+  useEffect(() => {
+    speedRef.current = playbackSpeed;
+    updateSourceRate();
+  }, [playbackSpeed]);
+
+  useEffect(() => {
+    fxRef.current = djFx;
+    channelRef.current?.applyParams(djFx);
+    updateSourceRate();
+  }, [djFx]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    readPersistedSnapshot<PersistedDJState>(DJ_PERSISTENCE_KEY).then(async (snapshot) => {
+      if (cancelled) return;
+      if (snapshot) {
+        await applyDjPersistedState(snapshot);
+      }
+      hasHydratedPersistenceRef.current = true;
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleSyncMessage = async (message: PersistenceSyncMessage) => {
+      if (message.key !== DJ_PERSISTENCE_KEY || message.sourceId === persistenceSourceIdRef.current) return;
+      if (message.updatedAt <= lastPersistenceUpdateRef.current) return;
+      if (message.cleared) {
+        await resetDjEditorState(false);
+        lastPersistenceUpdateRef.current = message.updatedAt;
+        return;
+      }
+
+      const snapshot = await readPersistedSnapshot<PersistedDJState>(DJ_PERSISTENCE_KEY);
+      if (snapshot && snapshot.updatedAt > lastPersistenceUpdateRef.current) {
+        await applyDjPersistedState(snapshot);
+      }
+    };
+
+    let channel: BroadcastChannel | null = null;
+    try {
+      channel = new BroadcastChannel(PERSISTENCE_SYNC_CHANNEL);
+      channel.onmessage = (event) => handleSyncMessage(event.data as PersistenceSyncMessage);
+    } catch {
+      channel = null;
+    }
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== PERSISTENCE_SYNC_STORAGE_KEY || !event.newValue) return;
+      try {
+        handleSyncMessage(JSON.parse(event.newValue) as PersistenceSyncMessage);
+      } catch {
+        // Ignore malformed sync messages.
+      }
+    };
+
+    window.addEventListener('storage', handleStorage);
+    return () => {
+      channel?.close();
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, []);
+
+  useEffect(() => {
+    queueDjPersistence();
+  }, [djTracks, activeTrackId, djPosition, isReverse, djBpm, playbackSpeed, djFx]);
+
+  useEffect(() => () => {
+    if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+    clearAnimation();
+    stopCurrentSource();
+    ctxRef.current?.close();
+  }, []);
+
+  return (
+    <div className="h-screen overflow-hidden bg-[#08090b] text-zinc-100">
+      <header className="flex h-16 items-center justify-between border-b border-white/10 bg-black/60 px-4 sm:px-6">
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={onBack}
+            aria-label="Back to main page"
+            title="Back"
+            className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white"
+          >
+            <SkipBack className="h-4 w-4" />
+          </button>
+          <div>
+            <h1 className="text-sm font-black uppercase tracking-[0.24em] text-white">DJ Audio Editor</h1>
+            <div className="mt-0.5 max-w-[46vw] truncate text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-500">{fileName}</div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <input ref={fileInputRef} type="file" accept="audio/*" multiple className="hidden" onChange={handleAudioUpload} />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isLoadingAudio}
+            className="inline-flex h-10 items-center gap-2 rounded-full border border-emerald-400/30 bg-emerald-500 px-4 text-[10px] font-bold uppercase tracking-widest text-white shadow-[0_0_22px_rgba(16,185,129,0.22)] hover:bg-emerald-400 disabled:cursor-wait disabled:opacity-60"
+          >
+            <Upload className="h-4 w-4" />
+            {isLoadingAudio ? 'Loading' : 'Upload Audio'}
+          </button>
+        </div>
+      </header>
+
+      <main className="grid h-[calc(100vh-4rem)] min-h-0 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(320px,0.9fr)_minmax(0,1.25fr)]">
+        <section className="flex min-h-0 flex-col border-r border-white/10 bg-zinc-950/70 p-4 sm:p-6">
+          <div
+            onPointerDown={beginScratch}
+            onPointerMove={moveScratch}
+            onPointerUp={endScratch}
+            onPointerCancel={endScratch}
+            className="mx-auto mt-3 flex aspect-square w-full max-w-[380px] touch-none items-center justify-center rounded-full border border-white/10 bg-[radial-gradient(circle_at_50%_45%,rgba(16,185,129,0.22),rgba(24,24,27,0.94)_58%,rgba(0,0,0,0.95))] shadow-[0_24px_80px_rgba(0,0,0,0.45)]"
+          >
+            <div className="flex aspect-square w-[72%] items-center justify-center rounded-full border border-white/10 bg-black/70 shadow-inner">
+              <div
+                className={cn(
+                  "flex aspect-square w-[62%] items-center justify-center rounded-full border border-emerald-400/40 bg-zinc-950 text-emerald-300",
+                  isDjPlaying && "animate-spin"
+                )}
+                style={{ animationDuration: '1.8s' }}
+              >
+                <Disc3 className="h-16 w-16" strokeWidth={1.4} />
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-5 space-y-4">
+            <input
+              type="range"
+              min="0"
+              max={duration || 1}
+              step="0.01"
+              value={duration ? djPosition : 0}
+              onChange={(event) => seekDjPosition(Number(event.target.value))}
+              disabled={!audioBuffer}
+              aria-label="DJ audio progress"
+              className="w-full accent-emerald-400"
+            />
+            <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-500">
+              <span>{formatDjTime(djPosition)}</span>
+              <span>{formatDjTime(duration)}</span>
+            </div>
+          </div>
+
+          <div className="mt-5 grid grid-cols-5 gap-2">
+            <button
+              type="button"
+              onClick={jumpDjStart}
+              disabled={!audioBuffer}
+              aria-label="Return DJ audio to start"
+              className="flex h-11 items-center justify-center rounded-full border border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10 disabled:opacity-30"
+            >
+              <SkipBack className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={rewindDjAudio}
+              disabled={!audioBuffer}
+              aria-label="Rewind DJ audio"
+              className="flex h-11 items-center justify-center rounded-full border border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10 disabled:opacity-30"
+            >
+              <RotateCcw className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => isDjPlaying ? pauseDjPlayback() : startDjPlayback()}
+              disabled={!audioBuffer}
+              aria-label={isDjPlaying ? 'Pause DJ audio' : 'Play DJ audio'}
+              className="flex h-11 items-center justify-center rounded-full bg-emerald-500 text-white shadow-[0_0_22px_rgba(16,185,129,0.28)] hover:bg-emerald-400 disabled:bg-zinc-800 disabled:text-zinc-600 disabled:shadow-none"
+            >
+              {isDjPlaying ? <Pause className="h-4 w-4" fill="currentColor" /> : <Play className="h-4 w-4" fill="currentColor" />}
+            </button>
+            <button
+              type="button"
+              onClick={toggleReversePlayback}
+              disabled={!audioBuffer}
+              aria-pressed={isReverse}
+              className={cn(
+                "flex h-11 items-center justify-center rounded-full border text-[10px] font-bold uppercase tracking-widest disabled:opacity-30",
+                isReverse ? "border-fuchsia-400 bg-fuchsia-500 text-white" : "border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10"
+              )}
+            >
+              Rev
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSpeedChange(1)}
+              disabled={!audioBuffer}
+              className="flex h-11 items-center justify-center rounded-full border border-white/10 bg-white/5 text-[10px] font-bold uppercase tracking-widest text-zinc-300 hover:bg-white/10 disabled:opacity-30"
+            >
+              1x
+            </button>
+          </div>
+
+          <div className="mt-6 flex min-h-0 flex-1 flex-col rounded-lg border border-white/10 bg-black/25">
+            <div className="flex items-center justify-between border-b border-white/10 px-3 py-3">
+              <div>
+                <h2 className="text-[10px] font-black uppercase tracking-[0.24em] text-zinc-300">Track Queue</h2>
+                <p className="mt-1 text-[9px] font-bold uppercase tracking-[0.16em] text-zinc-600">
+                  {activeTrack ? activeTrack.fileName : 'Upload audio to build a set'}
+                </p>
+              </div>
+              <span className="rounded-full bg-white/5 px-2 py-1 text-[9px] font-bold uppercase tracking-widest text-zinc-500">
+                {djTracks.length}
+              </span>
+            </div>
+            <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3 scrollbar-none">
+              {djTracks.length === 0 ? (
+                <div className="flex h-full min-h-28 items-center justify-center rounded border border-dashed border-white/10 text-center text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-600">
+                  No tracks loaded
+                </div>
+              ) : djTracks.map((track, index) => {
+                const isActiveTrack = track.id === activeTrackId;
+                const isDraggingTrack = track.id === draggingTrackId;
+                return (
+                  <div
+                    key={track.id}
+                    role="button"
+                    tabIndex={0}
+                    draggable
+                    onClick={() => selectDjTrackForPlayback(track.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        selectDjTrackForPlayback(track.id);
+                      }
+                    }}
+                    onDragStart={(event) => {
+                      setDraggingTrackId(track.id);
+                      event.dataTransfer.effectAllowed = 'move';
+                      event.dataTransfer.setData('text/plain', track.id);
+                    }}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = 'move';
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      const draggedId = event.dataTransfer.getData('text/plain') || draggingTrackId;
+                      const rect = event.currentTarget.getBoundingClientRect();
+                      const placement = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before';
+                      if (draggedId) reorderDjTrack(draggedId, track.id, placement);
+                      setDraggingTrackId(null);
+                    }}
+                    onDragEnd={() => setDraggingTrackId(null)}
+                    className={cn(
+                      "group flex cursor-grab items-center gap-3 rounded-lg border px-3 py-2 text-left transition-all active:cursor-grabbing",
+                      isActiveTrack
+                        ? "border-emerald-400/60 bg-emerald-500/12 text-white shadow-[0_0_18px_rgba(16,185,129,0.12)]"
+                        : "border-white/10 bg-white/[0.03] text-zinc-300 hover:bg-white/[0.07] hover:text-white",
+                      isDraggingTrack && "opacity-45"
+                    )}
+                  >
+                    <MoveHorizontal className={cn("h-4 w-4 shrink-0", isActiveTrack ? "text-emerald-300" : "text-zinc-600 group-hover:text-zinc-400")} />
+                    <span className="w-6 shrink-0 text-[10px] font-black uppercase tracking-widest text-zinc-600">
+                      {String(index + 1).padStart(2, '0')}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-[11px] font-black uppercase tracking-[0.18em]">{track.fileName}</div>
+                      <div className="mt-1 flex items-center gap-2 text-[9px] font-bold uppercase tracking-[0.16em] text-zinc-500">
+                        <span>{formatDjTime(track.duration)}</span>
+                        {!track.audio && <span className="text-amber-300">cache missing</span>}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={(event) => removeDjTrack(event, track.id)}
+                      aria-label={`Delete ${track.fileName}`}
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white/5 text-zinc-500 opacity-70 transition-colors hover:bg-red-500 hover:text-white group-hover:opacity-100"
+                    >
+                      <X className="h-3.5 w-3.5" strokeWidth={3} />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+
+        <section className="min-h-0 overflow-y-auto bg-[linear-gradient(180deg,#101114,#07080a)] p-4 sm:p-6">
+          <div className="grid gap-4 xl:grid-cols-2">
+            <div className="rounded-lg border border-white/10 bg-white/[0.03] p-4">
+              <div className="mb-4 flex items-center justify-between">
+                <h2 className="text-[11px] font-black uppercase tracking-[0.24em] text-zinc-200">Transport</h2>
+                <span className="rounded-full bg-white/5 px-2 py-1 text-[9px] font-bold uppercase tracking-[0.18em] text-zinc-500">
+                  {isReverse ? 'Reverse' : 'Forward'}
+                </span>
+              </div>
+
+              <div className="space-y-4">
+                <label className="block">
+                  <div className="mb-2 flex items-center justify-between text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-500">
+                    <span>BPM</span>
+                    <span className="text-zinc-200">{djBpm}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="60"
+                    max="200"
+                    step="1"
+                    value={djBpm}
+                    onChange={(event) => handleBpmChange(Number(event.target.value))}
+                    className="w-full accent-emerald-400"
+                  />
+                </label>
+
+                <label className="block">
+                  <div className="mb-2 flex items-center justify-between text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-500">
+                    <span>Speed</span>
+                    <span className="text-zinc-200">{playbackSpeed.toFixed(2)}x</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.25"
+                    max="2"
+                    step="0.01"
+                    value={playbackSpeed}
+                    onChange={(event) => handleSpeedChange(Number(event.target.value))}
+                    className="w-full accent-emerald-400"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-white/10 bg-white/[0.03] p-4">
+              <div className="mb-4 flex items-center justify-between">
+                <h2 className="text-[11px] font-black uppercase tracking-[0.24em] text-zinc-200">Scratch</h2>
+                <MoveHorizontal className="h-4 w-4 text-emerald-300" />
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                {[0.25, 0.5, 0.75, 1, 1.25, 1.5].map((speed) => (
+                  <button
+                    key={speed}
+                    type="button"
+                    onClick={() => handleSpeedChange(speed)}
+                    className={cn(
+                      "h-10 rounded border text-[10px] font-bold uppercase tracking-widest transition-colors",
+                      Math.abs(playbackSpeed - speed) < 0.01
+                        ? "border-emerald-400 bg-emerald-500 text-white"
+                        : "border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10 hover:text-white"
+                    )}
+                  >
+                    {speed}x
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-4 rounded-lg border border-white/10 bg-white/[0.03] p-4">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-[11px] font-black uppercase tracking-[0.24em] text-zinc-200">FX Rack</h2>
+	              <button
+	                type="button"
+	                onClick={() => resetDjEditorState()}
+	                title="Reset DJ page and clear local cache"
+	                className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-[9px] font-bold uppercase tracking-widest text-zinc-400 hover:bg-white/10 hover:text-white"
+	              >
+                Reset
+              </button>
+            </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              {DJ_FX_CONTROLS.map((control) => (
+                <label key={control.key} className="rounded-lg border border-white/5 bg-black/20 p-3">
+                  <div className="mb-2 flex items-center justify-between gap-3 text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-500">
+                    <span className="truncate">{control.name}</span>
+                    <span className="text-zinc-200">{djFx[control.key]}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={control.min}
+                    max={control.max}
+                    step={control.step ?? 1}
+                    value={djFx[control.key]}
+                    onChange={(event) => handleFxChange(control.key, Number(event.target.value))}
+                    className="w-full accent-emerald-400"
+                  />
+                </label>
+              ))}
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  );
+}
 
 export default function App() {
   const [initialWorkbench] = useState(hydrateSavedTabs);
   const [tabs, setTabs] = useState<TabData[]>(() => initialWorkbench?.tabs ?? [createCodexSongTab()]);
   const [selectedStyleId, setSelectedStyleId] = useState(initialWorkbench?.styleId ?? STYLE_PRESETS[0].id);
-  const [saveStatus, setSaveStatus] = useState<'idle' | 'saved' | 'loaded'>('idle');
   const [colorMode, setColorMode] = useState<ColorMode>(hydrateColorMode);
   const [pendingPlayIds, setPendingPlayIds] = useState<Set<string>>(() => new Set());
+  const [appRoute, setAppRoute] = useState<AppRoute>(getAppRouteFromPath);
+  const [isMainPersistenceReady, setIsMainPersistenceReady] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>('matrix');
   const [isGlobalRecording, setIsGlobalRecording] = useState(false);
   const [globalRecordingState, setGlobalRecordingState] = useState<GlobalRecordingState>('idle');
   const [arrangementEvents, setArrangementEvents] = useState<ArrangementEvent[]>([]);
   const [timelineClips, setTimelineClips] = useState<TimelineClip[]>([]);
   const [selectedTimelineClipId, setSelectedTimelineClipId] = useState<string | null>(null);
+  const [timelineDeleteHistory, setTimelineDeleteHistory] = useState<TimelineClip[][]>([]);
   const [timelinePlayhead, setTimelinePlayhead] = useState(0);
   const [isTimelinePlaying, setIsTimelinePlaying] = useState(false);
   const [timelineDuration, setTimelineDuration] = useState(DEFAULT_TIMELINE_SECONDS);
@@ -861,10 +2136,7 @@ export default function App() {
   const audioChunksRef = useRef<Blob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const importFileInputRef = useRef<HTMLInputElement>(null);
-  const exportFileHandleRef = useRef<ArrangementFileHandle | null>(null);
-  const [exportTarget, setExportTarget] = useState<ArrangementExportTarget | null>(null);
   const [isExportingArrangement, setIsExportingArrangement] = useState(false);
-  const [isSavingArrangementFile, setIsSavingArrangementFile] = useState(false);
   const globalRecordStartedAtRef = useRef<number>(0);
   const globalRecorderRef = useRef<MediaRecorder | null>(null);
   const globalRecordChunksRef = useRef<Blob[]>([]);
@@ -881,12 +2153,19 @@ export default function App() {
   const timelineOffsetRef = useRef(0);
   const timelineLoopRangeRef = useRef(timelineLoopRange);
   const timelinePlayheadRef = useRef(timelinePlayhead);
+  const mainPersistenceSourceIdRef = useRef(`main-${crypto.randomUUID().slice(0, 8)}`);
+  const mainPersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hasHydratedMainPersistenceRef = useRef(false);
+  const isApplyingMainPersistenceRef = useRef(false);
+  const lastMainPersistenceUpdateRef = useRef(0);
+  const mainQuotaWarningShownRef = useRef(false);
 
   // Keyboard states
   const [isKeyboardVisible, setIsKeyboardVisible] = useState(false);
   const [isRecordingKeyboard, setIsRecordingKeyboard] = useState(false);
   const [keyboardInstrumentMode, setKeyboardInstrumentMode] = useState(KEYBOARD_INSTRUMENT_MODES[0].id);
-  const [recordedNotes, setRecordedNotes] = useState<{time: number, note: number}[]>([]);
+  const [isKeyboardSustainEnabled, setIsKeyboardSustainEnabled] = useState(false);
+  const [recordedNotes, setRecordedNotes] = useState<KeyboardRecordingNote[]>([]);
   const [pressedKeyboardNotes, setPressedKeyboardNotes] = useState<number[]>([]);
   const [activeLiveFx, setActiveLiveFx] = useState<Record<string, boolean>>({});
   const [liveFxControls, setLiveFxControls] = useState<LiveFxControls>({
@@ -896,6 +2175,10 @@ export default function App() {
     fadeOut: 0.25,
   });
   const pressedKeyboardKeysRef = useRef<Set<number>>(new Set());
+  const keyboardInstrumentModeRef = useRef(keyboardInstrumentMode);
+  const isRecordingKeyboardRef = useRef(isRecordingKeyboard);
+  const keyboardSustainRef = useRef(isKeyboardSustainEnabled);
+  const recordedNotesRef = useRef<KeyboardRecordingNote[]>([]);
   const liveFxTimeoutsRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const liveFxControlsRef = useRef(liveFxControls);
   const recordStartTimeRef = useRef<number>(0);
@@ -971,20 +2254,82 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    setSaveStatus('idle');
-  }, [tabs, selectedStyleId]);
+    const handlePopState = () => setAppRoute(getAppRouteFromPath());
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
 
-    loadStoredExportTarget().then((record) => {
-      if (cancelled || !record) return;
-      exportFileHandleRef.current = record.handle;
-      setExportTarget({ fileName: record.fileName, savedAt: record.savedAt, mode: 'file-handle' });
+    readPersistedSnapshot<PersistedMainEditorState>(MAIN_PERSISTENCE_KEY).then(async (snapshot) => {
+      if (cancelled) return;
+      if (snapshot) {
+        await applyMainPersistedState(snapshot);
+      }
+      hasHydratedMainPersistenceRef.current = true;
+      setIsMainPersistenceReady(true);
     });
 
     return () => {
       cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleSyncMessage = async (message: PersistenceSyncMessage) => {
+      if (message.key !== MAIN_PERSISTENCE_KEY || message.sourceId === mainPersistenceSourceIdRef.current) return;
+      if (message.updatedAt <= lastMainPersistenceUpdateRef.current) return;
+      if (message.cleared) {
+        lastMainPersistenceUpdateRef.current = message.updatedAt;
+        const fresh = createCodexSongTab();
+        setRecordedSounds([]);
+        setTimelineClips([]);
+        setTimelineDeleteHistory([]);
+        setSelectedTimelineClipId(null);
+        setTimelinePlayhead(0);
+        timelinePlayheadRef.current = 0;
+        timelineOffsetRef.current = 0;
+        setTimelineLoopRange({ start: 0, end: 8 });
+        setTimelineDuration(DEFAULT_TIMELINE_SECONDS);
+        setTabs([fresh]);
+        setActiveTabId(fresh.id);
+        setSelectedStyleId(STYLE_PRESETS[0].id);
+        setViewMode('matrix');
+        engineManager.bpm = 120;
+        setBpm(120);
+        setIsKeyboardSustainEnabled(false);
+        syncProjectEngine(fresh);
+        return;
+      }
+
+      const snapshot = await readPersistedSnapshot<PersistedMainEditorState>(MAIN_PERSISTENCE_KEY);
+      if (snapshot && snapshot.updatedAt > lastMainPersistenceUpdateRef.current) {
+        await applyMainPersistedState(snapshot);
+      }
+    };
+
+    let channel: BroadcastChannel | null = null;
+    try {
+      channel = new BroadcastChannel(PERSISTENCE_SYNC_CHANNEL);
+      channel.onmessage = (event) => handleSyncMessage(event.data as PersistenceSyncMessage);
+    } catch {
+      channel = null;
+    }
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== PERSISTENCE_SYNC_STORAGE_KEY || !event.newValue) return;
+      try {
+        handleSyncMessage(JSON.parse(event.newValue) as PersistenceSyncMessage);
+      } catch {
+        // Ignore malformed sync messages.
+      }
+    };
+
+    window.addEventListener('storage', handleStorage);
+    return () => {
+      channel?.close();
+      window.removeEventListener('storage', handleStorage);
     };
   }, []);
 
@@ -1035,7 +2380,7 @@ export default function App() {
       pressedKeyboardKeysRef.current.clear();
       setPressedKeyboardNotes([]);
     };
-  }, [isKeyboardVisible, isRecordingKeyboard]);
+  }, [isKeyboardVisible]);
 
   useEffect(() => {
     return () => {
@@ -1047,6 +2392,18 @@ export default function App() {
     liveFxControlsRef.current = liveFxControls;
   }, [liveFxControls]);
 
+  useEffect(() => {
+    keyboardInstrumentModeRef.current = keyboardInstrumentMode;
+  }, [keyboardInstrumentMode]);
+
+  useEffect(() => {
+    isRecordingKeyboardRef.current = isRecordingKeyboard;
+  }, [isRecordingKeyboard]);
+
+  useEffect(() => {
+    keyboardSustainRef.current = isKeyboardSustainEnabled;
+  }, [isKeyboardSustainEnabled]);
+
   const syncProjectEngine = (tab: TabData) => {
     const engine = engineManager.getProject(tab.id);
     engine.setStyle(tab.styleId);
@@ -1056,29 +2413,18 @@ export default function App() {
     engine.setMasterFxParams(tab.masterFx);
   };
 
-  const persistWorkbench = (nextTabs = tabs, styleId = selectedStyleId) => {
-    const payload = {
-      styleId,
-      tabs: nextTabs.map((tab) => ({
-        ...tab,
-        slotIds: tab.slots.map((slot) => slot?.id ?? null),
-        slots: undefined,
-        isPlaying: false,
-        activeStep: 0,
-      })),
-    };
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-    setSaveStatus('saved');
+  const navigateAppRoute = (route: AppRoute) => {
+    const nextPath = route === 'dj' ? DJ_AUDIO_ROUTE : '/';
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState({}, '', nextPath);
+    }
+    setAppRoute(route);
   };
 
-  const loadWorkbench = () => {
-    const saved = hydrateSavedTabs();
-    if (!saved) return;
-    setTabs(saved.tabs);
-    setSelectedStyleId(saved.styleId);
-    setActiveTabId(saved.tabs[0].id);
-    saved.tabs.forEach(syncProjectEngine);
-    setSaveStatus('loaded');
+  const applyBpmPreset = (nextBpm: number) => {
+    const normalizedBpm = BPM_PRESETS.includes(nextBpm) ? nextBpm : 120;
+    engineManager.bpm = normalizedBpm;
+    setBpm(normalizedBpm);
   };
 
   const applyStylePreset = (styleId: string, tabId = activeTabId) => {
@@ -1159,9 +2505,22 @@ export default function App() {
     setTabs([fresh]);
     setActiveTabId(fresh.id);
     setSelectedStyleId(STYLE_PRESETS[0].id);
+    setRecordedSounds([]);
+    setTimelineClips([]);
+    setTimelineDeleteHistory([]);
+    setSelectedTimelineClipId(null);
+    setTimelinePlayhead(0);
+    timelinePlayheadRef.current = 0;
+    timelineOffsetRef.current = 0;
+    setTimelineLoopRange({ start: 0, end: 8 });
+    setTimelineDuration(DEFAULT_TIMELINE_SECONDS);
+    setViewMode('matrix');
+    engineManager.bpm = 120;
+    setBpm(120);
+    setIsKeyboardSustainEnabled(false);
     syncProjectEngine(fresh);
     window.localStorage.removeItem(STORAGE_KEY);
-    setSaveStatus('idle');
+    clearMainPersistence();
   };
 
   const addNewTab = () => {
@@ -1700,6 +3059,7 @@ export default function App() {
 
   interface MusicArrFile {
     version: '1.0';
+    bpm?: number;
     tabs: SerializedTabData[];
     recordedSounds: SerializableSoundDef[];
     timeline?: {
@@ -1715,7 +3075,36 @@ export default function App() {
     userSettings: {
       activeTabId: string;
       keyboardInstrumentMode: string;
+      keyboardSustainEnabled?: boolean;
       isKeyboardVisible?: boolean;
+    };
+  }
+
+  interface PersistedMainEditorState {
+    selectedStyleId: string;
+    activeTabId: string;
+    viewMode: ViewMode;
+    bpm: number;
+    tabs: SerializedTabData[];
+    recordedSounds: SerializableSoundDef[];
+    timeline: {
+      duration: number;
+      playhead: number;
+      loopRange: {
+        start: number;
+        end: number;
+      };
+      clips: TimelineClip[];
+      selectedClipId?: string | null;
+    };
+    keyboard: {
+      instrumentMode: string;
+      isVisible: boolean;
+      sustain: boolean;
+    };
+    library: {
+      isExtraOpen: boolean;
+      openExtraCategories: Record<string, boolean>;
     };
   }
 
@@ -1781,7 +3170,7 @@ export default function App() {
     return await engineManager.ctx.decodeAudioData(buffer);
   };
 
-  const serializeSoundDef = async (sound: SoundDef): Promise<SerializableSoundDef> => {
+	  const serializeSoundDef = async (sound: SoundDef): Promise<SerializableSoundDef> => {
     const serialized: SerializableSoundDef = {
       id: sound.id,
       name: sound.name,
@@ -1798,8 +3187,14 @@ export default function App() {
       serialized.numberOfChannels = sound.buffer.numberOfChannels;
     }
 
-    return serialized;
-  };
+	    return serialized;
+	  };
+
+	  const serializeSoundDefForPersistence = async (sound: SoundDef, includeAudio: boolean): Promise<SerializableSoundDef> => {
+	    if (includeAudio) return serializeSoundDef(sound);
+	    const { buffer: _buffer, ...rest } = sound;
+	    return rest;
+	  };
 
   const deserializeSoundDef = async (raw: SerializableSoundDef): Promise<SoundDef> => {
     const builtIn = AVAILABLE_SOUNDS.find((item) => item.id === raw.id && !raw.bufferBase64);
@@ -1824,7 +3219,7 @@ export default function App() {
     return result;
   };
 
-  const createMusicarrPayload = async (): Promise<MusicArrFile> => {
+	  const createMusicarrPayload = async (): Promise<MusicArrFile> => {
     const tabsPayload = await Promise.all(tabs.map(async (tab) => ({
       id: tab.id,
       name: tab.name,
@@ -1841,6 +3236,7 @@ export default function App() {
 
     return {
       version: '1.0',
+      bpm,
       tabs: tabsPayload,
       recordedSounds: recordedPayload,
       timeline: {
@@ -1853,12 +3249,172 @@ export default function App() {
       userSettings: {
         activeTabId,
         keyboardInstrumentMode,
+        keyboardSustainEnabled: isKeyboardSustainEnabled,
         isKeyboardVisible,
       },
-    };
-  };
+	    };
+	  };
 
-  const createMusicarrText = async () => {
+	  const createMainPersistenceData = async (includeAudio: boolean): Promise<PersistedMainEditorState> => {
+	    const tabsPayload = await Promise.all(tabs.map(async (tab) => ({
+	      id: tab.id,
+	      name: tab.name,
+	      slots: await Promise.all(tab.slots.map((slot) => slot ? serializeSoundDefForPersistence(slot, includeAudio) : null)),
+	      mutedSlots: tab.mutedSlots,
+	      moduleFx: tab.fxSlots,
+	      masterFx: tab.masterFx,
+	      styleId: tab.styleId,
+	      activeStep: 0,
+	      isPlaying: false,
+	    })));
+
+	    const recordedPayload = await Promise.all(recordedSounds.map(sound => serializeSoundDefForPersistence(sound, includeAudio)));
+
+	    return {
+	      selectedStyleId,
+	      activeTabId,
+	      viewMode,
+	      bpm,
+	      tabs: tabsPayload,
+	      recordedSounds: recordedPayload,
+	      timeline: {
+	        duration: timelineDuration,
+	        playhead: timelinePlayheadRef.current,
+	        loopRange: timelineLoopRange,
+	        clips: timelineClips,
+	        selectedClipId: selectedTimelineClipId,
+	      },
+	      keyboard: {
+	        instrumentMode: keyboardInstrumentMode,
+	        isVisible: isKeyboardVisible,
+	        sustain: isKeyboardSustainEnabled,
+	      },
+	      library: {
+	        isExtraOpen: isExtraLibraryOpen,
+	        openExtraCategories,
+	      },
+	    };
+	  };
+
+	  const applyMainPersistedState = async (snapshot: PersistedSnapshot<PersistedMainEditorState>) => {
+	    isApplyingMainPersistenceRef.current = true;
+	    try {
+	      const data = snapshot.data;
+	      const importedRecordedSounds = await Promise.all((data.recordedSounds || []).map(deserializeSoundDef));
+	      const importedTabs = await Promise.all((data.tabs || []).map(async (tab) => ({
+	        id: tab.id,
+	        name: tab.name,
+	        slots: await Promise.all(tab.slots.map((slot) => slot ? deserializeSoundDef(slot) : null)),
+	        mutedSlots: tab.mutedSlots,
+	        fxSlots: tab.moduleFx ?? tab.fxSlots ?? new Array(7).fill(null).map(defaultFx),
+	        masterFx: tab.masterFx,
+	        styleId: tab.styleId ?? 'default',
+	        isPlaying: false,
+	        activeStep: 0,
+	      })));
+
+	      if (!importedTabs.length) return;
+	      const nextDuration = Math.max(1, Math.min(600, Number(data.timeline?.duration) || DEFAULT_TIMELINE_SECONDS));
+	      const nextLoopStart = Math.max(0, Math.min(data.timeline?.loopRange?.start ?? 0, nextDuration - 0.25));
+	      const nextLoopEnd = Math.max(nextLoopStart + 0.25, Math.min(data.timeline?.loopRange?.end ?? Math.min(8, nextDuration), nextDuration));
+	      const nextPlayhead = Math.max(0, Math.min(data.timeline?.playhead ?? nextLoopStart, nextDuration));
+	      const nextClips = (data.timeline?.clips || []).map((clip) => {
+	        const duration = Math.max(0.5, Math.min(clip.duration, nextDuration));
+	        return {
+	          ...clip,
+	          track: Math.max(0, Math.min(TIMELINE_TRACKS - 1, clip.track)),
+	          start: Math.max(0, Math.min(clip.start, Math.max(0, nextDuration - duration))),
+	          duration,
+	          trimStart: Math.max(0, clip.trimStart),
+	        };
+	      });
+
+	      setRecordedSounds(importedRecordedSounds);
+	      setTabs(importedTabs);
+	      setSelectedStyleId(data.selectedStyleId || STYLE_PRESETS[0].id);
+	      setActiveTabId(importedTabs.some(tab => tab.id === data.activeTabId) ? data.activeTabId : importedTabs[0].id);
+	      setViewMode(data.viewMode || 'matrix');
+	      const nextBpm = Math.max(40, Math.min(240, Number(data.bpm) || engineManager.bpm));
+	      engineManager.bpm = nextBpm;
+	      setBpm(nextBpm);
+	      setKeyboardInstrumentMode(data.keyboard?.instrumentMode || KEYBOARD_INSTRUMENT_MODES[0].id);
+	      setIsKeyboardSustainEnabled(Boolean(data.keyboard?.sustain));
+	      setIsKeyboardVisible(Boolean(data.keyboard?.isVisible));
+	      setIsExtraLibraryOpen(Boolean(data.library?.isExtraOpen));
+	      setOpenExtraCategories(data.library?.openExtraCategories || {});
+	      setTimelineDuration(nextDuration);
+	      setTimelineLoopRange({ start: nextLoopStart, end: nextLoopEnd });
+	      setTimelinePlayhead(nextPlayhead);
+	      timelinePlayheadRef.current = nextPlayhead;
+	      timelineOffsetRef.current = nextPlayhead;
+	      setTimelineClips(nextClips);
+	      setTimelineDeleteHistory([]);
+	      setSelectedTimelineClipId(data.timeline?.selectedClipId ?? null);
+
+	      importedTabs.forEach((tab) => {
+	        const engine = engineManager.getProject(tab.id);
+	        engine.setStyle(tab.styleId);
+	        engine.setSlots(tab.slots);
+	        engine.setMutedSlots(tab.mutedSlots);
+	        tab.fxSlots.forEach((fx, index) => engine.setFxParams(index, fx));
+	        engine.setMasterFxParams(tab.masterFx);
+	      });
+	      lastMainPersistenceUpdateRef.current = snapshot.updatedAt;
+	    } finally {
+	      isApplyingMainPersistenceRef.current = false;
+	    }
+	  };
+
+	  const persistMainEditorState = async (includeAudio = true) => {
+	    if (!hasHydratedMainPersistenceRef.current || isApplyingMainPersistenceRef.current) return;
+	    const updatedAt = Date.now();
+	    try {
+	      const data = await createMainPersistenceData(includeAudio);
+	      const snapshot: PersistedSnapshot<PersistedMainEditorState> = {
+	        version: PERSISTENCE_STATE_VERSION,
+	        updatedAt,
+	        data,
+	        degraded: !includeAudio,
+	      };
+	      await writePersistedSnapshot(MAIN_PERSISTENCE_KEY, snapshot);
+	      lastMainPersistenceUpdateRef.current = updatedAt;
+	      emitPersistenceSync({ key: MAIN_PERSISTENCE_KEY, updatedAt, sourceId: mainPersistenceSourceIdRef.current });
+	    } catch (err) {
+	      if (includeAudio && isQuotaExceededError(err)) {
+	        if (!mainQuotaWarningShownRef.current) {
+	          mainQuotaWarningShownRef.current = true;
+	          alert('浏览器本地存储空间不足，已优先保留最新编排、时间线和参数；部分录音素材可能无法完整缓存。');
+	        }
+	        await persistMainEditorState(false);
+	        return;
+	      }
+	      console.error('Main editor persistence failed', err);
+	    }
+	  };
+
+	  const queueMainPersistence = () => {
+	    if (!hasHydratedMainPersistenceRef.current || isApplyingMainPersistenceRef.current) return;
+	    if (mainPersistTimerRef.current) clearTimeout(mainPersistTimerRef.current);
+	    mainPersistTimerRef.current = setTimeout(() => {
+	      mainPersistTimerRef.current = null;
+	      persistMainEditorState();
+	    }, 800);
+	  };
+
+	  const clearMainPersistence = async (emit = true) => {
+	    if (mainPersistTimerRef.current) {
+	      clearTimeout(mainPersistTimerRef.current);
+	      mainPersistTimerRef.current = null;
+	    }
+	    const updatedAt = Date.now();
+	    lastMainPersistenceUpdateRef.current = updatedAt;
+	    await deletePersistedSnapshot(MAIN_PERSISTENCE_KEY);
+	    if (emit) {
+	      emitPersistenceSync({ key: MAIN_PERSISTENCE_KEY, updatedAt, sourceId: mainPersistenceSourceIdRef.current, cleared: true });
+	    }
+	  };
+
+	  const createMusicarrText = async () => {
     const payload = await createMusicarrPayload();
     return JSON.stringify(payload, null, 2);
   };
@@ -1897,17 +3453,6 @@ export default function App() {
     await writable.close();
   };
 
-  const rememberExportTarget = async (handle: ArrangementFileHandle) => {
-    const target = {
-      fileName: handle.name,
-      savedAt: Date.now(),
-      mode: 'file-handle' as const,
-    };
-    exportFileHandleRef.current = handle;
-    setExportTarget(target);
-    await storeExportTarget({ ...target, handle });
-  };
-
   const isPickerAbort = (err: unknown) => err instanceof DOMException && err.name === 'AbortError';
 
   const handleExportArrangement = async () => {
@@ -1932,7 +3477,6 @@ export default function App() {
           ],
         });
         await writeArrangementFile(handle, text);
-        await rememberExportTarget(handle);
         return;
       }
 
@@ -1940,37 +3484,12 @@ export default function App() {
       if (!fallbackName) return;
       const fileName = sanitizeMusicarrFileName(fallbackName);
       downloadMusicarrFile(text, fileName);
-      exportFileHandleRef.current = null;
-      setExportTarget({ fileName, savedAt: Date.now(), mode: 'download' });
     } catch (err) {
       if (isPickerAbort(err)) return;
       console.error('Export failed', err);
       alert('导出失败，请重试。');
     } finally {
       setIsExportingArrangement(false);
-    }
-  };
-
-  const handleSaveArrangementFile = async () => {
-    if (!exportTarget || isSavingArrangementFile || isExportingArrangement) return;
-    const handle = exportFileHandleRef.current;
-
-    setIsSavingArrangementFile(true);
-    try {
-      const text = await createMusicarrText();
-      if (handle) {
-        await writeArrangementFile(handle, text);
-        await rememberExportTarget(handle);
-      } else {
-        downloadMusicarrFile(text, exportTarget.fileName);
-        setExportTarget({ ...exportTarget, savedAt: Date.now() });
-      }
-    } catch (err) {
-      if (isPickerAbort(err)) return;
-      console.error('Save failed', err);
-      alert('保存失败，请确认浏览器文件权限，或点击 Export 重新选择保存位置。');
-    } finally {
-      setIsSavingArrangementFile(false);
     }
   };
 
@@ -2006,7 +3525,11 @@ export default function App() {
       setRecordedSounds(importedRecordedSounds);
       setTabs(importedTabs);
       setActiveTabId(data.userSettings?.activeTabId || importedTabs[0]?.id || 'tab-1');
+      const nextBpm = Math.max(40, Math.min(240, Number(data.bpm) || 120));
+      engineManager.bpm = nextBpm;
+      setBpm(nextBpm);
       setKeyboardInstrumentMode(data.userSettings?.keyboardInstrumentMode || KEYBOARD_INSTRUMENT_MODES[0].id);
+      setIsKeyboardSustainEnabled(Boolean(data.userSettings?.keyboardSustainEnabled));
       setIsKeyboardVisible(Boolean(data.userSettings?.isKeyboardVisible));
       if (data.timeline) {
         const nextDuration = Math.max(1, Math.min(600, Number(data.timeline.duration) || DEFAULT_TIMELINE_SECONDS));
@@ -2029,9 +3552,11 @@ export default function App() {
         timelinePlayheadRef.current = nextPlayhead;
         timelineOffsetRef.current = nextPlayhead;
         setTimelineClips(nextClips);
+        setTimelineDeleteHistory([]);
         setSelectedTimelineClipId(data.timeline.selectedClipId ?? null);
       } else {
         setTimelineClips([]);
+        setTimelineDeleteHistory([]);
         setSelectedTimelineClipId(null);
       }
 
@@ -2218,6 +3743,28 @@ export default function App() {
       }
       return { ...clip, duration: Math.max(0.5, clip.duration + amount) };
     }));
+  };
+
+  const deleteSelectedTimelineClip = () => {
+    if (!selectedTimelineClipId) return;
+    const clip = timelineClips.find(item => item.id === selectedTimelineClipId);
+    if (!clip) return;
+    if (isTimelinePlaying) stopTimelinePlayback(false);
+    setTimelineDeleteHistory(prev => [...prev.slice(-19), [clip]]);
+    setTimelineClips(prev => prev.filter(item => item.id !== selectedTimelineClipId));
+    setSelectedTimelineClipId(null);
+  };
+
+  const undoTimelineDelete = () => {
+    const restored = timelineDeleteHistory[timelineDeleteHistory.length - 1];
+    if (!restored?.length) return;
+    setTimelineClips(current => {
+      const currentIds = new Set(current.map(clip => clip.id));
+      return [...current, ...restored.filter(clip => !currentIds.has(clip.id))]
+        .sort((a, b) => a.track - b.track || a.start - b.start);
+    });
+    setSelectedTimelineClipId(restored[0]?.id ?? null);
+    setTimelineDeleteHistory(prev => prev.slice(0, -1));
   };
 
   const beginTimelineEdit = (event: React.PointerEvent, clip: TimelineClip, mode: TimelinePointerEdit['mode']) => {
@@ -2774,12 +4321,20 @@ export default function App() {
             Trim Out
           </button>
           <button
-            onClick={() => selectedTimelineClipId && setTimelineClips(prev => prev.filter(clip => clip.id !== selectedTimelineClipId))}
+            onClick={deleteSelectedTimelineClip}
             disabled={!selectedTimelineClipId}
             className="flex h-9 items-center gap-2 rounded border border-red-500/30 bg-red-500/10 px-3 text-[10px] font-bold uppercase tracking-widest text-red-300 disabled:opacity-35"
           >
             <Trash2 size={12} />
             Delete
+          </button>
+          <button
+            onClick={undoTimelineDelete}
+            disabled={timelineDeleteHistory.length === 0}
+            className={cn("flex h-9 items-center gap-2 rounded border px-3 text-[10px] font-bold uppercase tracking-widest disabled:opacity-35", softButtonClass)}
+          >
+            <RotateCcw size={12} />
+            Undo Delete
           </button>
         </div>
       </section>
@@ -3177,120 +4732,172 @@ export default function App() {
   };
 
   // Keyboard functions
-  const playKeyboardNote = (note: number) => {
-    engineManager.init();
-    if (!engineManager.ctx) return;
+  const getKeyboardInstrument = (instrumentId: string) => (
+    KEYBOARD_INSTRUMENT_MODES.find(i => i.id === instrumentId) ?? KEYBOARD_INSTRUMENT_MODES[0]
+  );
 
-    const instrument = KEYBOARD_INSTRUMENT_MODES.find(i => i.id === keyboardInstrumentMode) ?? KEYBOARD_INSTRUMENT_MODES[0];
+  const triggerKeyboardSynthVoice = (
+    ctx: BaseAudioContext,
+    destination: AudioNode,
+    note: number,
+    instrumentId: string,
+    startTime: number,
+    sustain: boolean,
+  ) => {
+    const instrument = getKeyboardInstrument(instrumentId);
     const frequency = 440 * Math.pow(2, (note - 69) / 12);
-    const now = engineManager.ctx.currentTime;
-
-    const gain = engineManager.ctx.createGain();
-    const filter = engineManager.ctx.createBiquadFilter();
-    const master = engineManager.ctx.createGain();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    const filter = ctx.createBiquadFilter();
+    const master = ctx.createGain();
+    const tail = sustain ? 1.35 : 0;
+    const duration = instrument.id === 'bell'
+      ? 0.72 + tail
+      : instrument.id === 'bass'
+        ? 0.54 + tail * 0.72
+        : 0.44 + tail * 0.86;
+    const peak = instrument.id === 'bass' ? 0.34 : instrument.id === 'bell' ? 0.2 : instrument.id === 'synth' ? 0.24 : 0.22;
 
     let mainInput: AudioNode;
-    const osc = engineManager.ctx.createOscillator();
+    let extraOsc: OscillatorNode | null = null;
+    let modOsc: OscillatorNode | null = null;
     osc.type = instrument.waveform;
-    osc.frequency.value = frequency * (instrument.id === 'bass' ? 0.5 : 1);
+    osc.frequency.setValueAtTime(frequency * (instrument.id === 'bass' ? 0.5 : 1), startTime);
 
     if (instrument.id === 'synth') {
-      const osc2 = engineManager.ctx.createOscillator();
-      osc2.type = 'sawtooth';
-      osc2.frequency.value = frequency * 1.01;
-      const mix = engineManager.ctx.createGain();
-      mix.gain.value = 0.5;
+      extraOsc = ctx.createOscillator();
+      extraOsc.type = 'sawtooth';
+      extraOsc.frequency.setValueAtTime(frequency * 1.01, startTime);
+      const mix = ctx.createGain();
+      mix.gain.setValueAtTime(0.5, startTime);
       osc.connect(mix);
-      osc2.connect(mix);
+      extraOsc.connect(mix);
       mainInput = mix;
-      osc2.start(now);
-      osc2.stop(now + 0.35);
     } else if (instrument.id === 'bell') {
-      const mod = engineManager.ctx.createOscillator();
-      mod.type = 'triangle';
-      mod.frequency.value = 220;
-      const modGain = engineManager.ctx.createGain();
-      modGain.gain.value = 40;
-      mod.connect(modGain);
+      modOsc = ctx.createOscillator();
+      modOsc.type = 'triangle';
+      modOsc.frequency.setValueAtTime(220, startTime);
+      const modGain = ctx.createGain();
+      modGain.gain.setValueAtTime(44, startTime);
+      modOsc.connect(modGain);
       modGain.connect(osc.frequency);
       mainInput = osc;
-      mod.start(now);
-      mod.stop(now + 0.5);
     } else {
       mainInput = osc;
     }
 
     if (instrument.id === 'bass') {
       filter.type = 'lowpass';
-      filter.frequency.setValueAtTime(600, now);
-      filter.Q.setValueAtTime(1.5, now);
-      gain.gain.setValueAtTime(0.35, now);
+      filter.frequency.setValueAtTime(680, startTime);
+      filter.frequency.exponentialRampToValueAtTime(240, startTime + Math.min(duration, 0.8));
+      filter.Q.setValueAtTime(1.5, startTime);
     } else if (instrument.id === 'bell') {
       filter.type = 'highpass';
-      filter.frequency.setValueAtTime(800, now);
-      filter.Q.setValueAtTime(1.8, now);
-      gain.gain.setValueAtTime(0.18, now);
+      filter.frequency.setValueAtTime(720, startTime);
+      filter.Q.setValueAtTime(1.8, startTime);
     } else if (instrument.id === 'synth') {
       filter.type = 'lowpass';
-      filter.frequency.setValueAtTime(1800, now);
-      filter.Q.setValueAtTime(1.2, now);
-      gain.gain.setValueAtTime(0.22, now);
+      filter.frequency.setValueAtTime(2200, startTime);
+      filter.frequency.exponentialRampToValueAtTime(sustain ? 900 : 1200, startTime + Math.min(duration, 0.9));
+      filter.Q.setValueAtTime(1.2, startTime);
     } else {
       filter.type = 'lowpass';
-      filter.frequency.setValueAtTime(2500, now);
-      filter.Q.setValueAtTime(0.8, now);
-      gain.gain.setValueAtTime(0.2, now);
+      filter.frequency.setValueAtTime(2800, startTime);
+      filter.Q.setValueAtTime(0.8, startTime);
     }
+
+    gain.gain.setValueAtTime(0.0001, startTime);
+    gain.gain.linearRampToValueAtTime(peak, startTime + 0.015);
+    gain.gain.setValueAtTime(peak * (sustain ? 0.72 : 0.5), startTime + 0.08);
+    gain.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
+    master.gain.setValueAtTime(0.96, startTime);
 
     mainInput.connect(filter);
     filter.connect(gain);
     gain.connect(master);
-    master.connect(engineManager.ctx.destination);
+    master.connect(destination);
 
-    const release = instrument.id === 'bell' ? 0.6 : instrument.id === 'bass' ? 0.5 : 0.35;
-    gain.gain.setTargetAtTime(0.0001, now + 0.02, 0.08);
-    master.gain.setValueAtTime(1, now);
-
-    osc.start(now);
-    osc.stop(now + release);
-
-    if (instrument.id === 'synth') {
-      // synth second oscillator is stopped above
+    if (sustain) {
+      const delay = ctx.createDelay(0.45);
+      const feedback = ctx.createGain();
+      const wet = ctx.createGain();
+      delay.delayTime.setValueAtTime(0.18, startTime);
+      feedback.gain.setValueAtTime(0.22, startTime);
+      wet.gain.setValueAtTime(0.18, startTime);
+      delay.connect(feedback);
+      feedback.connect(delay);
+      delay.connect(wet);
+      wet.connect(destination);
+      gain.connect(delay);
     }
+
+    osc.start(startTime);
+    osc.stop(startTime + duration + 0.05);
+    if (extraOsc) {
+      extraOsc.start(startTime);
+      extraOsc.stop(startTime + duration + 0.05);
+    }
+    if (modOsc) {
+      modOsc.start(startTime);
+      modOsc.stop(startTime + Math.min(duration, 1.6));
+    }
+  };
+
+  const renderKeyboardRecordingBuffer = async (notes: KeyboardRecordingNote[], totalDurationMs: number) => {
+    const sampleRate = 44100;
+    const tail = notes.some(note => note.sustain) ? 1.6 : 0.8;
+    const totalSeconds = Math.min(64, Math.max(1, totalDurationMs / 1000 + tail));
+    const ctx = new OfflineAudioContext(2, Math.ceil(totalSeconds * sampleRate), sampleRate);
+    const master = ctx.createGain();
+    master.gain.setValueAtTime(0.92, 0);
+    master.connect(ctx.destination);
+    notes.forEach((event) => {
+      const start = Math.max(0, (event.time - recordStartTimeRef.current) / 1000);
+      if (start < totalSeconds) {
+        triggerKeyboardSynthVoice(ctx, master, event.note, event.instrumentId, start, event.sustain);
+      }
+    });
+    return ctx.startRendering();
+  };
+
+  const playKeyboardNote = (note: number) => {
+    engineManager.init();
+    const ctx = engineManager.ctx;
+    if (!ctx) return;
+    triggerKeyboardSynthVoice(
+      ctx,
+      ctx.destination,
+      note,
+      keyboardInstrumentModeRef.current,
+      ctx.currentTime,
+      keyboardSustainRef.current,
+    );
   };
 
   const startKeyboardRecording = () => {
     setIsRecordingKeyboard(true);
+    recordedNotesRef.current = [];
     setRecordedNotes([]);
     recordStartTimeRef.current = Date.now();
   };
 
-  const stopKeyboardRecording = () => {
+  const stopKeyboardRecording = async () => {
     setIsRecordingKeyboard(false);
-    if (recordedNotes.length > 0) {
+    isRecordingKeyboardRef.current = false;
+    const notes = recordedNotesRef.current;
+    if (notes.length > 0) {
       const totalDuration = Math.max(1, Date.now() - recordStartTimeRef.current);
-      const stepDuration = totalDuration / 16;
-      const stepNotes = new Array<Set<number>>(16).fill(null).map(() => new Set<number>());
-
-      recordedNotes.forEach(({ time, note }) => {
-        const step = Math.min(15, Math.max(0, Math.floor((time - recordStartTimeRef.current) / stepDuration)));
-        stepNotes[step].add(note);
-      });
-
-      const pattern = stepNotes.map((notes) => {
-        if (notes.size === 0) return {};
-        const values = Array.from(notes).sort((a, b) => a - b);
-        return { note: values.length === 1 ? values[0] : values };
-      });
-
-      const instrument = KEYBOARD_INSTRUMENT_MODES.find(i => i.id === keyboardInstrumentMode) ?? KEYBOARD_INSTRUMENT_MODES[0];
+      const firstInstrument = getKeyboardInstrument(notes[0]?.instrumentId ?? keyboardInstrumentModeRef.current);
+      const buffer = await renderKeyboardRecordingBuffer(notes, totalDuration);
       const newSound: SoundDef = {
         id: `keyboard-${Date.now()}`,
-        name: `${instrument.name} Seq ${recordedSounds.filter(s => s.id.startsWith('keyboard-')).length + 1}`,
+        name: `${firstInstrument.name} Keys ${recordedSounds.filter(s => s.id.startsWith('keyboard-')).length + 1}`,
         category: 'custom',
-        color: instrument.color,
-        pattern,
-        loopMode: 'full'
+        color: firstInstrument.color,
+        pattern: [{ note: 1 }, ...new Array(15).fill({})],
+        buffer,
+        loopMode: 'full',
+        playMode: 'buffer'
       };
 
       setRecordedSounds(prev => [...prev, newSound]);
@@ -3313,8 +4920,15 @@ export default function App() {
 
   const handleKeyboardKeyPress = (note: number) => {
     playKeyboardNote(note);
-    if (isRecordingKeyboard) {
-      setRecordedNotes(prev => [...prev, { time: Date.now(), note }]);
+    if (isRecordingKeyboardRef.current) {
+      const event = {
+        time: Date.now(),
+        note,
+        instrumentId: keyboardInstrumentModeRef.current,
+        sustain: keyboardSustainRef.current,
+      };
+      recordedNotesRef.current = [...recordedNotesRef.current, event];
+      setRecordedNotes(recordedNotesRef.current);
     }
   };
 
@@ -3326,12 +4940,10 @@ export default function App() {
     { id: 'experimental', name: 'Experimental' },
     { id: 'theme', name: '旋律组' },
   ];
-  const extraCategories = [
-    { id: 'animal', name: 'Animal Samples' },
-  ];
+  const extraCategories: { id: string; name: string }[] = [];
   const customCategory = { id: 'custom', name: 'Custom / Recorded' };
 
-  const fxConfig: { key: keyof FxParams; name: string; min: number; max: number }[] = [
+	  const fxConfig: { key: keyof FxParams; name: string; min: number; max: number }[] = [
     { key: 'lpf', name: 'DJ Lowpass', min: 0, max: 100 },
     { key: 'hpf', name: 'Highpass', min: 0, max: 100 },
     { key: 'volume', name: 'Fade Vol', min: 0, max: 100 },
@@ -3341,10 +4953,35 @@ export default function App() {
     { key: 'pitch', name: 'Speed/Pitch', min: -12, max: 12 },
     { key: 'panSwing', name: 'Pan Swing', min: 0, max: 100 },
     { key: 'compressor', name: 'Compressor', min: 0, max: 100 },
-    { key: 'flanger', name: 'Flanger', min: 0, max: 100 },
-  ];
+	    { key: 'flanger', name: 'Flanger', min: 0, max: 100 },
+	  ];
 
-  const workbenchStyle = {
+	  useEffect(() => {
+	    queueMainPersistence();
+	  }, [
+	    tabs,
+	    selectedStyleId,
+	    activeTabId,
+	    viewMode,
+	    bpm,
+	    recordedSounds,
+	    timelineClips,
+	    selectedTimelineClipId,
+	    timelinePlayhead,
+	    timelineDuration,
+	    timelineLoopRange,
+	    keyboardInstrumentMode,
+	    isKeyboardSustainEnabled,
+	    isKeyboardVisible,
+	    isExtraLibraryOpen,
+	    openExtraCategories,
+	  ]);
+
+	  useEffect(() => () => {
+	    if (mainPersistTimerRef.current) clearTimeout(mainPersistTimerRef.current);
+	  }, []);
+
+	  const workbenchStyle = {
     background:
       colorMode === 'day'
         ? `radial-gradient(circle at 50% 18%, ${activeStyle.panel}, transparent 40%), linear-gradient(135deg, rgba(255,255,255,0.96), rgba(245,247,250,0.86))`
@@ -3375,14 +5012,7 @@ export default function App() {
       : globalRecordingState === 'stopping'
         ? 'Waiting for the next global BPM loop start to finish recording'
         : 'Click to start recording at the next global BPM loop start';
-  const canSaveArrangementFile = Boolean(exportTarget) && !isSavingArrangementFile && !isExportingArrangement;
-  const saveArrangementTitle = exportTarget
-    ? exportTarget.mode === 'file-handle'
-      ? `保存到上次导出的文件：${exportTarget.fileName}`
-      : `使用上次导出文件名保存：${exportTarget.fileName}`
-    : '首次 Export 成功后可用';
-
-  const renderLibraryCategory = (cat: { id: string; name: string }) => {
+	  const renderLibraryCategory = (cat: { id: string; name: string }) => {
     const staticItems = AVAILABLE_SOUNDS.filter(s => s.category === cat.id);
     const customItems = cat.id === 'custom' ? recordedSounds : [];
     const items = [...staticItems, ...customItems];
@@ -3426,21 +5056,31 @@ export default function App() {
                     ))}
                  </div>
                  <div className={cn("text-[8px] uppercase tracking-tighter truncate", isDayMode ? "text-slate-400" : "text-zinc-600")}>
-                  {cat.id === 'custom' ? 'RECORDED' : cat.id === 'beat' ? 'LOOP / 120' : cat.id === 'animal' ? 'EXTRA / RARE' : 'SYNTH'}
+                  {cat.id === 'custom' ? 'RECORDED' : cat.id === 'beat' ? `LOOP / ${bpm}` : 'SYNTH'}
                  </div>
                </div>
             </div>
           ))}
         </div>
       </div>
-    );
-  };
+	    );
+	  };
 
-  return (
+	  if (!isMainPersistenceReady && appRoute !== 'dj') {
+	    return (
+	      <div className="flex h-screen items-center justify-center bg-[#0c0c0e] text-[11px] font-bold uppercase tracking-[0.24em] text-zinc-500">
+	        Loading local session
+	      </div>
+	    );
+	  }
+
+	  return (
+    <>
     <div
       className={cn(
         "h-screen font-sans flex flex-col overflow-hidden select-none transition-colors duration-300",
-        isDayMode ? "bg-slate-100 text-slate-700" : "bg-[#0c0c0e] text-zinc-300"
+        isDayMode ? "bg-slate-100 text-slate-700" : "bg-[#0c0c0e] text-zinc-300",
+        appRoute === 'dj' && "hidden"
       )}
       style={{
         background: isDayMode
@@ -3516,39 +5156,33 @@ export default function App() {
           </button>
 
 	          <button
-	             onClick={handleSaveArrangementFile}
-	             disabled={!canSaveArrangementFile}
-	             aria-label={saveArrangementTitle}
-	             title={saveArrangementTitle}
-	             className={cn(
-	               "px-3 py-2 rounded-lg text-[9px] font-bold uppercase tracking-widest transition-all inline-flex items-center gap-1.5",
-	               canSaveArrangementFile
-	                 ? "bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white"
-	                 : "bg-white/[0.03] text-zinc-700 cursor-not-allowed"
-	             )}
-	          >
-	             <Save size={12} strokeWidth={2.6} />
-	             {isSavingArrangementFile ? 'Saving' : 'Save'}
-	          </button>
-	          <button
 	             onClick={handleExportArrangement}
-	             disabled={isExportingArrangement || isSavingArrangementFile}
+	             disabled={isExportingArrangement}
 	             className={cn(
 	               "px-3 py-2 rounded-lg text-[9px] font-bold uppercase tracking-widest transition-all",
-	               isExportingArrangement || isSavingArrangementFile
+	               isExportingArrangement
 	                 ? "bg-white/[0.03] text-zinc-700 cursor-wait"
 	                 : "bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white"
 	             )}
 	          >
 	             {isExportingArrangement ? 'Exporting' : 'Export'}
 	          </button>
-          <button
-             onClick={() => importFileInputRef.current?.click()}
-             className="px-3 py-2 rounded-lg bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white text-[9px] font-bold uppercase tracking-widest transition-all"
-          >
-             Import
-          </button>
-          <input
+	          <button
+	             onClick={() => importFileInputRef.current?.click()}
+	             className="px-3 py-2 rounded-lg bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white text-[9px] font-bold uppercase tracking-widest transition-all"
+	          >
+	             Import
+	          </button>
+	          <button
+	             onClick={() => navigateAppRoute('dj')}
+	             aria-label="Open DJ audio editor"
+	             title="Open DJ audio editor"
+	             className="px-3 py-2 rounded-lg bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25 hover:text-emerald-100 text-[9px] font-bold uppercase tracking-widest transition-all inline-flex items-center gap-1.5"
+	          >
+	             <Disc3 size={12} strokeWidth={2.5} />
+	             DJ
+	          </button>
+	          <input
             type="file"
             accept=".musicarr,application/json"
             className="hidden"
@@ -3640,6 +5274,24 @@ export default function App() {
                 </option>
               ))}
             </select>
+          </div>
+          <div className={cn("flex h-10 shrink-0 items-center gap-1 rounded border px-2", isDayMode ? "bg-slate-900/5 border-slate-900/10" : "bg-white/5 border-white/5")}>
+            <span className={cn("px-1 text-[10px] font-bold uppercase tracking-widest", mutedTextClass)}>BPM</span>
+            {BPM_PRESETS.map((preset) => (
+              <button
+                key={preset}
+                type="button"
+                onClick={() => applyBpmPreset(preset)}
+                className={cn(
+                  "h-7 rounded px-2 font-mono text-[10px] font-bold transition-colors",
+                  bpm === preset
+                    ? "bg-emerald-500 text-white"
+                    : isDayMode ? "text-slate-500 hover:bg-white hover:text-slate-950" : "text-zinc-500 hover:bg-white/10 hover:text-zinc-200"
+                )}
+              >
+                {preset}
+              </button>
+            ))}
           </div>
           <button
             onClick={shuffleActiveTab}
@@ -4045,6 +5697,7 @@ export default function App() {
           
           <div className="flex-1 flex flex-col gap-3 overflow-y-auto pr-2 scrollbar-none pb-4">
             {categories.map(renderLibraryCategory)}
+            {extraCategories.length > 0 && (
             <div className="flex flex-col gap-2">
               <button
                 type="button"
@@ -4079,6 +5732,7 @@ export default function App() {
                 </div>
               ))}
             </div>
+            )}
             {renderLibraryCategory(customCategory)}
           </div>
         </section>
@@ -4107,7 +5761,7 @@ export default function App() {
               exit={{ y: 16, opacity: 0, scale: 0.95 }}
               transition={{ type: 'spring', stiffness: 260, damping: 24 }}
               onMouseDown={(e) => e.stopPropagation()}
-              className="w-full max-w-4xl rounded-3xl border border-white/10 bg-zinc-950/95 shadow-2xl overflow-hidden"
+              className="flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-3xl border border-white/10 bg-zinc-950/95 shadow-2xl"
             >
               <div className="flex items-start justify-between gap-4 p-4 border-b border-white/10">
                 <div className="space-y-1">
@@ -4123,7 +5777,7 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_minmax(280px,0.85fr)]">
+              <div className="grid min-h-0 flex-1 gap-4 overflow-y-auto p-4 lg:grid-cols-[minmax(0,1fr)_minmax(280px,0.85fr)]">
                 <section className="space-y-4">
                   <div className="flex flex-wrap items-center gap-3">
                     {KEYBOARD_INSTRUMENT_MODES.map((mode) => (
@@ -4153,34 +5807,55 @@ export default function App() {
                     >
                       <Circle className={cn("w-4 h-4", isRecordingKeyboard ? 'text-white' : 'text-red-500')} />
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => setIsKeyboardSustainEnabled(prev => !prev)}
+                      aria-pressed={isKeyboardSustainEnabled}
+                      className={cn(
+                        "rounded-full border px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.2em] transition-all",
+                        isKeyboardSustainEnabled
+                          ? "border-emerald-300 bg-emerald-500 text-white shadow-[0_0_18px_rgba(16,185,129,0.2)]"
+                          : "border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10 hover:text-white"
+                      )}
+                    >
+                      Sustain
+                    </button>
                   </div>
 
-                  <div className="grid grid-cols-4 gap-2">
-                    {KEYBOARD_NOTES.map((row, rowIndex) =>
-                      row.map((note, colIndex) => {
-                        const keyIndex = rowIndex * 4 + colIndex;
-                        const physicalKey = KEYBOARD_PHYSICAL_KEYS[keyIndex];
-                        const isPressed = pressedKeyboardNotes.includes(note);
+                  <div className="space-y-2">
+                    {KEYBOARD_KEY_ROWS.map((row, rowIndex) => (
+                      <div
+                        key={rowIndex}
+                        className={cn(
+                          "grid gap-1.5",
+                          rowIndex === 0 ? "grid-cols-10" : rowIndex === 1 ? "ml-[5%] grid-cols-9" : "ml-[15%] grid-cols-7"
+                        )}
+                      >
+                        {row.map((keyDef) => {
+                        const isPressed = pressedKeyboardNotes.includes(keyDef.note);
                         const instrument = KEYBOARD_INSTRUMENT_MODES.find(i => i.id === keyboardInstrumentMode) ?? KEYBOARD_INSTRUMENT_MODES[0];
                         return (
                           <button
-                            key={`${rowIndex}-${colIndex}`}
-                            onMouseDown={() => handleKeyboardNoteDown(note)}
-                            onMouseUp={() => handleKeyboardNoteUp(note)}
-                            onMouseLeave={() => handleKeyboardNoteUp(note)}
+                            key={keyDef.physicalKey}
+                            onMouseDown={() => handleKeyboardNoteDown(keyDef.note)}
+                            onMouseUp={() => handleKeyboardNoteUp(keyDef.note)}
+                            onMouseLeave={() => handleKeyboardNoteUp(keyDef.note)}
                             className={cn(
-                              "aspect-square rounded-2xl border flex flex-col items-center justify-center text-xs font-mono transition-all",
+                              "h-16 rounded-lg border flex flex-col items-center justify-center text-xs font-mono transition-all sm:h-20",
                               isPressed
                                 ? `${instrument.color} text-white border-white/50 shadow-lg shadow-current scale-105`
-                                : "bg-zinc-900 hover:bg-zinc-800 active:bg-zinc-700 border-white/10 text-zinc-300 hover:text-white"
+                                : keyDef.isBlack
+                                  ? "bg-zinc-950 hover:bg-zinc-900 active:bg-zinc-800 border-white/10 text-zinc-400 hover:text-white"
+                                  : "bg-zinc-100 hover:bg-white active:bg-zinc-200 border-white/20 text-zinc-900"
                             )}
                           >
-                            <span>{KEYBOARD_NOTE_LABELS[keyIndex]}</span>
-                            <span className="text-[8px] opacity-70 mt-1">{physicalKey.toUpperCase()}</span>
+                            <span>{keyDef.label}</span>
+                            <span className="text-[8px] opacity-70 mt-1">{keyDef.physicalKey.toUpperCase()}</span>
                           </button>
                         );
-                      })
-                    )}
+                        })}
+                      </div>
+                    ))}
                   </div>
                 </section>
 
@@ -4297,5 +5972,9 @@ export default function App() {
         )}
       </AnimatePresence>
     </div>
+    <div className={appRoute === 'dj' ? 'fixed inset-0 z-[100] block' : 'hidden'}>
+      <DJAudioEditorPage onBack={() => navigateAppRoute('main')} />
+    </div>
+    </>
   );
 }
