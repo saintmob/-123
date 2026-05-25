@@ -75,6 +75,14 @@ VITE_SHOW_WS_URL=ws://192.168.x.x:4300/ws
 
 端口保持不变。
 
+如果你不想手写两个地址，也可以直接指定主机 IP：
+
+```env
+VITE_LAN_HOST=192.168.x.x
+```
+
+代码会优先使用 `VITE_LAN_HOST` / `SHOW_LAN_HOST`，并且会忽略 `localhost`、`127.0.0.1`、`0.0.0.0` 这类本地默认值。
+
 ## 音频帧协议
 
 DJ 会向 4300 WebSocket 发布高频 `mixer.audioFrame`，用于驱动 VJ：
