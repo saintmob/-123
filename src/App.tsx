@@ -285,7 +285,12 @@ const formatDjTime = (value: number) => {
   return `${minutes}:${seconds}`;
 };
 
-const createDjTrackId = () => `dj-track-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+const createIdFragment = () => {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  return uuid ? uuid.slice(0, 8) : Math.random().toString(36).slice(2, 10);
+};
+
+const createDjTrackId = () => `dj-track-${Date.now()}-${createIdFragment()}`;
 
 const makeFx = (overrides: Partial<FxParams> = {}): FxParams => ({
   ...defaultFx(),
@@ -1081,7 +1086,7 @@ function DJAudioEditorPage({ onBack }: { onBack: () => void }) {
   const fxRef = useRef(djFx);
   const effectiveRateRef = useRef(1);
   const scratchEditRef = useRef<ScratchEdit | null>(null);
-  const persistenceSourceIdRef = useRef(`dj-${crypto.randomUUID().slice(0, 8)}`);
+  const persistenceSourceIdRef = useRef(`dj-${createIdFragment()}`);
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hasHydratedPersistenceRef = useRef(false);
   const isApplyingPersistenceRef = useRef(false);
@@ -2153,7 +2158,7 @@ export default function App() {
   const timelineOffsetRef = useRef(0);
   const timelineLoopRangeRef = useRef(timelineLoopRange);
   const timelinePlayheadRef = useRef(timelinePlayhead);
-  const mainPersistenceSourceIdRef = useRef(`main-${crypto.randomUUID().slice(0, 8)}`);
+  const mainPersistenceSourceIdRef = useRef(`main-${createIdFragment()}`);
   const mainPersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hasHydratedMainPersistenceRef = useRef(false);
   const isApplyingMainPersistenceRef = useRef(false);
@@ -2183,7 +2188,7 @@ export default function App() {
   const liveFxControlsRef = useRef(liveFxControls);
   const recordStartTimeRef = useRef<number>(0);
   const showControlRef = useRef<ReturnType<typeof createShowControlClient> | null>(null);
-  const showControlClientIdRef = useRef(`dj-music-editor-${crypto.randomUUID().slice(0, 8)}`);
+  const showControlClientIdRef = useRef(`dj-music-editor-${createIdFragment()}`);
   const showControlCommandRef = useRef<(command: ControlCommand) => void>(() => undefined);
   const [showControlStatus, setShowControlStatus] = useState<'connecting' | 'connected' | 'offline'>('connecting');
   const activeTabRef = useRef(activeTab);

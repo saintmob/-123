@@ -1,3 +1,5 @@
+import { SHOW_BACKEND_URL, SHOW_WS_URL } from './runtimeConfig';
+
 export type ModuleName = 'audio' | 'visual' | 'interaction';
 
 export type ControlCommand = {
@@ -14,7 +16,8 @@ export type ControlCommand = {
 
 type ServerMessage =
   | { type: 'state.snapshot'; state: unknown }
-  | { type: 'state.patch'; state: unknown }
+  | { type: 'state.patch'; module: ModuleName; patch: Record<string, unknown>; updatedAt?: number }
+  | { type: 'show.patch'; patch: Record<string, unknown>; updatedAt?: number }
   | ControlCommand
   | { type: 'control.ack'; ok: boolean; command: ControlCommand }
   | { type: 'error'; error: string }
@@ -54,8 +57,8 @@ type ShowControlClient = {
 };
 
 const env = (import.meta as any).env || {};
-const backendUrl = (env.VITE_SHOW_BACKEND_URL || 'http://localhost:4300').replace(/\/$/, '');
-const wsUrl = env.VITE_SHOW_WS_URL || backendUrl.replace(/^http/, 'ws') + '/ws';
+const backendUrl = SHOW_BACKEND_URL.replace(/\/$/, '');
+const wsUrl = SHOW_WS_URL.replace(/\/$/, '');
 const controlToken = env.VITE_CONTROL_TOKEN || '';
 const databaseUrl = String(env.VITE_FIREBASE_DATABASE_URL || '').replace(/\/$/, '');
 const showId = env.VITE_SHOW_ID || 'show-main';
