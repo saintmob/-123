@@ -81,7 +81,7 @@ VITE_SHOW_WS_URL=ws://192.168.x.x:4300/ws
 VITE_LAN_HOST=192.168.x.x
 ```
 
-代码会优先使用 `VITE_LAN_HOST` / `SHOW_LAN_HOST`，并且会忽略 `localhost`、`127.0.0.1`、`0.0.0.0` 这类本地默认值。
+代码会优先使用 `VITE_LAN_HOST`，并且会忽略 `localhost`、`127.0.0.1`、`0.0.0.0` 这类本地默认值。
 
 ## 音频帧协议
 
