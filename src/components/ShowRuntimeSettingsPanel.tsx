@@ -36,6 +36,7 @@ export function ShowRuntimeSettingsPanel({ status, clientIdRequired = false }: P
             <span className="text-[9px] uppercase tracking-widest text-zinc-500">Transport</span>
             <select className="mt-1 w-full rounded-lg border border-white/10 bg-black px-3 py-2 text-xs" value={settings.transport} onChange={(event) => update('transport', event.target.value)}>
               <option value="websocket">websocket</option>
+              <option value="cloudflare">cloudflare</option>
               <option value="firebase">firebase</option>
               <option value="auto">auto</option>
             </select>
