@@ -57,31 +57,7 @@ Vite 配置固定为：
 
 ## 连接 4300
 
-本地默认配置：
-
-```env
-VITE_SHOW_TRANSPORT=websocket
-VITE_SHOW_BACKEND_URL=http://localhost:4300
-VITE_SHOW_WS_URL=ws://localhost:4300/ws
-VITE_SHOW_ID=show-main
-```
-
-跨机器部署时，把 `localhost` 换成控制机 LAN IP：
-
-```env
-VITE_SHOW_BACKEND_URL=http://192.168.x.x:4300
-VITE_SHOW_WS_URL=ws://192.168.x.x:4300/ws
-```
-
-端口保持不变。
-
-如果你不想手写两个地址，也可以直接指定主机 IP：
-
-```env
-VITE_LAN_HOST=192.168.x.x
-```
-
-代码会优先使用 `VITE_LAN_HOST`，并且会忽略 `localhost`、`127.0.0.1`、`0.0.0.0` 这类本地默认值。
+代码内置当前演出默认运行配置。内部开发者通常只需要在主界面或受控环境中填写控制令牌；令牌为空时不会连接控制通道。
 
 ## 音频帧协议
 
@@ -129,17 +105,11 @@ DJ 不直接控制 baofa。baofa 的屏幕 owner、debug、menu、tree/firework 
 
 ## Token 说明
 
-如果 4300 设置了 `CONTROL_TOKEN`，浏览器端可通过 `VITE_CONTROL_TOKEN` 连接。但注意：
+控制令牌是必要运行条件。不要把真实令牌写入 README、提交记录或公开示例。
 
-- `VITE_` 变量会进入前端 bundle，不是秘密。
-- 本地/LAN 演出时它适合作为共享口令，防止误连。
-- 公网部署时不要把高权限 token 放在 `VITE_` 变量里。
+## 部署说明
 
-## Vercel / 远程部署
-
-这个模块可以作为静态页面部署，但默认 `localhost:4300` 在公网环境会指向访问者自己的机器，不会连接现场总控。
-
-如需远程部署，必须显式配置公网可达的 4300 替代服务；现场演出仍推荐本机或同 LAN 运行。
+线上与备用通道的地址、供应商和运行细节不写入公开 README。代码默认配置用于当前组合项目；如需变更，由主界面运行时配置或受控环境管理。
 
 ## 开发注意
 

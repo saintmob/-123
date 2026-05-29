@@ -64,6 +64,11 @@ const showId = SHOW_ID;
 const transport = SHOW_TRANSPORT;
 
 export function createShowControlClient(options: ClientOptions): ShowControlClient {
+  if (!controlToken.trim()) {
+    options.onStatus?.('offline');
+    options.onError?.('Control token is required before show control can connect');
+    return createDisabledClient();
+  }
   if (shouldUseFirebase()) {
     if ((transport === 'websocket' || transport === 'cloudflare') && databaseUrl) {
       options.onError?.(`WebSocket URL ${wsUrl || '(empty)'} is not usable from this page; falling back to Firebase`);
@@ -71,6 +76,23 @@ export function createShowControlClient(options: ClientOptions): ShowControlClie
     return createFirebaseClient(options);
   }
   return createWebSocketClient(options);
+}
+
+function createDisabledClient(): ShowControlClient {
+  return {
+    publishState() {
+      return;
+    },
+    publishAudioFrame() {
+      return;
+    },
+    async postState() {
+      throw new Error('Control token is required');
+    },
+    close() {
+      return;
+    },
+  };
 }
 
 function shouldUseFirebase() {
