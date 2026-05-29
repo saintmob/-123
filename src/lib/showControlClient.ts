@@ -213,6 +213,7 @@ function createFirebaseClient(options: ClientOptions): ShowControlClient {
   let closed = false;
   let lastPatch = '';
   let pendingPatch: Record<string, unknown> | null = null;
+  let lastAudioFrameWriteAt = 0;
 
   const connect = async () => {
     if (closed) return;
@@ -285,8 +286,14 @@ function createFirebaseClient(options: ClientOptions): ShowControlClient {
         options.onError?.(error instanceof Error ? error.message : String(error));
       });
     },
-    publishAudioFrame(_frame: AudioFrameMessage) {
-      return;
+    publishAudioFrame(frame: AudioFrameMessage) {
+      const now = Date.now();
+      if (now - lastAudioFrameWriteAt < 120) return;
+      lastAudioFrameWriteAt = now;
+      void publishFirebaseAudioFrame(frame).catch((error) => {
+        options.onStatus?.('offline');
+        options.onError?.(error instanceof Error ? error.message : String(error));
+      });
     },
     async postState(patch: Record<string, unknown>) {
       pendingPatch = patch;
@@ -298,6 +305,32 @@ function createFirebaseClient(options: ClientOptions): ShowControlClient {
       void firebaseDelete(`${rootPath}/clients/${safePath(options.clientId)}`).catch(() => undefined);
     },
   };
+
+  async function publishFirebaseAudioFrame(frame: AudioFrameMessage) {
+    if (options.module !== 'audio') return;
+    const now = Date.now();
+    const sourceId = String(frame.sourceId || options.clientId);
+    const masterLevel = typeof frame.level === 'number' ? clampUnit(frame.muted ? 0 : frame.level) : undefined;
+    const updates: Record<string, unknown> = {
+      [`state/audioSources/${safePath(sourceId)}`]: {
+        ...frame,
+        sourceId,
+        timestamp: typeof frame.timestamp === 'number' ? frame.timestamp : now,
+      },
+      'state/modules/audio/activeSourceId': sourceId,
+      'state/updatedAt': now,
+      [`clients/${safePath(options.clientId)}/lastSeen`]: now,
+    };
+    if (typeof masterLevel === 'number') updates['state/modules/audio/masterLevel'] = masterLevel;
+    if (typeof frame.bpm === 'number') {
+      updates['state/modules/audio/bpm'] = Math.max(0, frame.bpm);
+      updates['state/show/bpm'] = Math.max(0, frame.bpm);
+    }
+    if (typeof frame.transport === 'string') updates['state/modules/audio/transport'] = frame.transport;
+    if (typeof frame.activePreset === 'string') updates['state/modules/audio/activePreset'] = frame.activePreset;
+    if (typeof frame.activeStep === 'number') updates['state/modules/audio/activeStep'] = frame.activeStep;
+    await firebasePatch(rootPath, updates);
+  }
 }
 
 function makeClientInfo(options: ClientOptions) {
@@ -355,6 +388,10 @@ async function firebaseWrite(method: 'PUT' | 'PATCH', path: string, value: unkno
 
 function jsonUrl(path: string) {
   return `${databaseUrl}/${path}.json`;
+}
+
+function clampUnit(value: number) {
+  return Math.max(0, Math.min(1, value));
 }
 
 function safePath(value: string) {
