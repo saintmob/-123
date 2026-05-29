@@ -3,7 +3,7 @@ const lanHost = String(env.VITE_LAN_HOST || '').trim();
 const RUNTIME_SETTINGS_KEY = 'vad.showRuntimeSettings.v1';
 
 export type ShowRuntimeSettings = {
-  transport: 'websocket' | 'firebase' | 'auto';
+  transport: 'websocket' | 'firebase' | 'cloudflare' | 'auto';
   backendUrl: string;
   wsUrl: string;
   showId: string;
@@ -61,7 +61,7 @@ export function loadShowRuntimeSettings(): ShowRuntimeSettings {
       backendUrl: normalizeRuntimeUrl(stored.backendUrl) || defaults.backendUrl,
       wsUrl: normalizeRuntimeUrl(stored.wsUrl) || defaults.wsUrl,
       firebaseDatabaseUrl: normalizeRuntimeUrl(stored.firebaseDatabaseUrl) || defaults.firebaseDatabaseUrl,
-      transport: ['websocket', 'firebase', 'auto'].includes(String(stored.transport)) ? stored.transport as ShowRuntimeSettings['transport'] : defaults.transport,
+      transport: ['websocket', 'firebase', 'cloudflare', 'auto'].includes(String(stored.transport)) ? stored.transport as ShowRuntimeSettings['transport'] : defaults.transport,
     };
   } catch {
     return defaults;

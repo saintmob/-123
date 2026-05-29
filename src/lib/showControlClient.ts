@@ -64,14 +64,41 @@ const showId = SHOW_ID;
 const transport = SHOW_TRANSPORT;
 
 export function createShowControlClient(options: ClientOptions): ShowControlClient {
-  if (shouldUseFirebase()) return createFirebaseClient(options);
+  if (shouldUseFirebase()) {
+    if ((transport === 'websocket' || transport === 'cloudflare') && databaseUrl) {
+      options.onError?.(`WebSocket URL ${wsUrl || '(empty)'} is not usable from this page; falling back to Firebase`);
+    }
+    return createFirebaseClient(options);
+  }
   return createWebSocketClient(options);
 }
 
 function shouldUseFirebase() {
   if (transport === 'firebase') return Boolean(databaseUrl);
-  if (transport === 'websocket') return false;
-  return Boolean(databaseUrl) && backendUrl.includes('vercel.app');
+  if (transport === 'websocket' || transport === 'cloudflare') return !isUsableWebSocketUrl() && Boolean(databaseUrl);
+  if (isUsableWebSocketUrl()) return false;
+  return Boolean(databaseUrl);
+}
+
+function isUsableWebSocketUrl() {
+  if (!wsUrl) return false;
+  try {
+    const url = new URL(wsUrl);
+    if (url.protocol !== 'ws:' && url.protocol !== 'wss:') return false;
+    const pageProtocol = typeof window !== 'undefined' ? window.location.protocol : 'http:';
+    const pageHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+    const pageIsLocal = isLocalHost(pageHost);
+    if (pageProtocol === 'https:' && url.protocol !== 'wss:') return false;
+    if (isLocalHost(url.hostname) && !pageIsLocal) return false;
+    if (url.hostname.endsWith('vercel.app')) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isLocalHost(hostname: string) {
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0';
 }
 
 function createWebSocketClient(options: ClientOptions): ShowControlClient {
