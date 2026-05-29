@@ -4,6 +4,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import { AUDIO_STYLES, AVAILABLE_SOUNDS, AudioStyleId, SoundDef, engineManager, FxParams, defaultFx, SlotChannel } from './audio';
 import { cn } from './lib/utils';
 import { createShowControlClient, type AudioFrameMessage, type ControlCommand } from './lib/showControlClient';
+import { SHOW_CLIENT_ID } from './lib/runtimeConfig';
+import { ShowRuntimeSettingsPanel } from './components/ShowRuntimeSettingsPanel';
 
 const KEYBOARD_INSTRUMENT_MODES = [
   { id: 'piano', name: 'Piano', color: 'bg-blue-500', waveform: 'sine' as OscillatorType },
@@ -2188,7 +2190,7 @@ export default function App() {
   const liveFxControlsRef = useRef(liveFxControls);
   const recordStartTimeRef = useRef<number>(0);
   const showControlRef = useRef<ReturnType<typeof createShowControlClient> | null>(null);
-  const showControlClientIdRef = useRef(`dj-music-editor-${createIdFragment()}`);
+  const showControlClientIdRef = useRef(SHOW_CLIENT_ID || `dj-music-editor-${createIdFragment()}`);
   const showControlCommandRef = useRef<(command: ControlCommand) => void>(() => undefined);
   const [showControlStatus, setShowControlStatus] = useState<'connecting' | 'connected' | 'offline'>('connecting');
   const activeTabRef = useRef(activeTab);
@@ -5081,7 +5083,8 @@ export default function App() {
 
 	  return (
     <>
-    <div
+    <ShowRuntimeSettingsPanel status={showControlStatus} clientIdRequired />
+	    <div
       className={cn(
         "h-screen font-sans flex flex-col overflow-hidden select-none transition-colors duration-300",
         isDayMode ? "bg-slate-100 text-slate-700" : "bg-[#0c0c0e] text-zinc-300",
